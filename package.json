@@ -1,0 +1,11 @@
+{
+  "name": "teachback",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:client": "npm --prefix client run dev",
+    "build:client": "npm --prefix client run build",
+    "dev:server": "uvicorn server.main:app --reload",
+    "start": "uvicorn server.main:app --host 0.0.0.0 --port 8080"
+  }
+}

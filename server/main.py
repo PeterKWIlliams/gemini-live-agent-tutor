@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import defaultdict
 import contextlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import uuid
 import wave
@@ -15,12 +17,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from google.cloud import storage as gcs_storage
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -36,6 +40,7 @@ from server.material_parser import generate_topic_material, maybe_summarize_mate
 from server.modes import MODES, list_modes
 from server.personas import PERSONAS, list_personas
 from server.scoring import SCORING_FALLBACK_PROMPT, SCORE_FUNCTION, WRAP_UP_PROMPT
+from server.trails_store import TrailDocumentRecord, TrailRecord, TrailStore
 
 load_dotenv()
 
@@ -47,11 +52,35 @@ SESSION_TTL = timedelta(minutes=15)
 STOP_TOOL_TIMEOUT_SECONDS = 8
 WRAP_UP_WAIT_SECONDS = 4
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+TRAILS_DB_PATH = Path(os.getenv("TEACHBACK_DB_PATH", STATIC_DIR.parent / "data" / "teachback.db"))
+PRESET_TRAILS_DIR = Path(os.getenv("PRESET_TRAILS_DIR", STATIC_DIR.parent / "seed_documents"))
+PRESET_TRAILS_GCS_BUCKET = os.getenv("PRESET_TRAILS_GCS_BUCKET", "").strip()
+PRESET_TRAILS_GCS_PREFIX = os.getenv("PRESET_TRAILS_GCS_PREFIX", "").strip().strip("/")
+PRESET_TRAILS_AUTO_SYNC = os.getenv("PRESET_TRAILS_AUTO_SYNC", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PRECOMPUTED_TEXT_ARTIFACTS = ("material.txt", "prepared.txt")
+PRECOMPUTED_JSON_ARTIFACT = "prepared.json"
 
 
 class TopicPayload(BaseModel):
     topic: str = Field(min_length=2, max_length=200)
     description: str = Field(default="", max_length=4000)
+
+
+class TrailCreatePayload(BaseModel):
+    title: str = Field(min_length=2, max_length=200)
+    description: str = Field(default="", max_length=1000)
+
+
+@dataclass
+class SourceDocument:
+    name: str
+    label: str
+    mime_type: str
 
 
 class ScorePayload(BaseModel):
@@ -126,64 +155,591 @@ def build_client():
     return genai.Client(api_key=api_key) if api_key else genai.Client()
 
 
+def build_gcs_client():
+    if not PRESET_TRAILS_GCS_BUCKET:
+        return None
+    try:
+        return gcs_storage.Client()
+    except Exception as exc:  # pragma: no cover - depends on local/cloud auth state
+        LOGGER.warning("Could not initialize GCS client for preset trails: %s", exc)
+        return None
+
+
 def preview_text(material: str) -> str:
     compact = material.replace("\n", " ").strip()
     return compact[:200] + ("..." if len(compact) > 200 else "")
 
 
-def get_sample_material_text() -> str:
-    raw_text = os.getenv("SAMPLE_MATERIAL_TEXT", "")
-    return raw_text.replace("\\n", "\n").strip()
+def build_session_payload(record: SessionRecord) -> dict[str, Any]:
+    return {
+        "session_id": record.session_id,
+        "material_preview": record.material_preview,
+        "material_text": record.material,
+    }
 
 
-def get_sample_material_options() -> list[dict[str, str]]:
-    raw_options = os.getenv("SAMPLE_MATERIAL_OPTIONS", "").strip()
-    options: list[dict[str, str]] = []
+def safe_document_name(filename: str) -> str | None:
+    name = Path(filename).name
+    if not name or name != filename or "/" in filename or "\\" in filename:
+        return None
+    return name
 
-    if raw_options:
-        try:
-            parsed = json.loads(raw_options)
-        except json.JSONDecodeError:
-            LOGGER.warning("SAMPLE_MATERIAL_OPTIONS is not valid JSON.")
-        else:
-            if isinstance(parsed, list):
-                for index, item in enumerate(parsed):
-                    if not isinstance(item, dict):
-                        continue
-                    option_id = str(item.get("id", "")).strip() or f"sample_{index + 1}"
-                    label = str(item.get("label", "")).strip() or f"Sample {index + 1}"
-                    text = str(item.get("text", "")).replace("\\n", "\n").strip()
-                    if text:
-                        options.append(
-                            {
-                                "id": option_id,
-                                "label": label,
-                                "text": text,
-                                "preview": preview_text(text),
-                            }
-                        )
-            else:
-                LOGGER.warning("SAMPLE_MATERIAL_OPTIONS must be a JSON array.")
 
-    if options:
-        return options
-
-    sample_text = get_sample_material_text()
-    if not sample_text:
-        return []
-
-    return [
-        {
-            "id": "sample_material",
-            "label": "Sample material",
-            "text": sample_text,
-            "preview": preview_text(sample_text),
-        }
-    ]
+def pdf_label_from_filename(filename: str) -> str:
+    stem = Path(filename).stem.replace("_", " ").replace("-", " ").strip()
+    return stem.title() or filename
 
 
 def build_transcript_text(messages: list[dict[str, str]]) -> str:
     return "\n".join(f"{item['speaker']}: {item['text']}" for item in messages if item["text"].strip())
+
+
+async def prepare_material_input(
+    client,
+    file: UploadFile | None = None,
+    text: str | None = None,
+) -> str:
+    if file is None and not (text or "").strip():
+        raise HTTPException(status_code=400, detail="Provide a file or pasted text.")
+
+    if (text or "").strip():
+        material = await maybe_summarize_material(client, normalize_text(text or ""))
+    else:
+        file_bytes = await file.read()
+        material = await prepare_material_bytes(
+            client,
+            file_bytes,
+            file.filename or "upload",
+            file.content_type or "",
+        )
+
+    if not material:
+        raise HTTPException(status_code=400, detail="Could not prepare study material from that input.")
+
+    return material
+
+
+async def prepare_material_bytes(client, file_bytes: bytes, filename: str, mime_type: str) -> str:
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File too large. Keep uploads under 10MB.")
+    try:
+        material = await parse_material(client, file_bytes, filename, mime_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not material:
+        raise HTTPException(status_code=400, detail="Could not prepare study material from that input.")
+    return material
+
+
+async def create_prepared_session(store: SessionStore, material: str) -> SessionRecord:
+    session_id = str(uuid.uuid4())
+    record = SessionRecord(session_id=session_id, material=material, material_preview=preview_text(material))
+    await store.set(record)
+    return record
+
+
+async def merge_trail_documents(client, documents: list[TrailDocumentRecord]) -> str:
+    parts: list[str] = []
+    for document in documents:
+        body = normalize_text(document.content_text)
+        if not body:
+            continue
+        parts.append(f"Document: {document.filename}\n\n{body}")
+
+    merged_material = normalize_text("\n\n".join(parts))
+    if not merged_material:
+        raise HTTPException(status_code=400, detail="No readable material exists in this trail yet.")
+
+    return await maybe_summarize_material(client, merged_material)
+
+
+async def refresh_trail_material(client, trail_store: TrailStore, trail_id: str):
+    documents = trail_store.get_trail_documents(trail_id)
+    merged_material = await merge_trail_documents(client, documents)
+    updated = trail_store.update_trail_material(trail_id, merged_material, preview_text(merged_material))
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Trail not found.")
+    return updated, documents
+
+
+def humanize_seed_name(name: str) -> str:
+    return " ".join(part.capitalize() for part in name.replace("-", "_").split("_") if part)
+
+
+def build_document_tuples_from_material_text(material_text: str, source_name: str) -> list[tuple[str, str, str]]:
+    normalized = normalize_text(material_text)
+    if not normalized:
+        return []
+    return [(source_name, "text/plain", normalized)]
+
+
+def parse_seed_metadata_text(raw_text: str, fallback_name: str) -> tuple[str, str]:
+    title = humanize_seed_name(fallback_name)
+    description = ""
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        LOGGER.warning("Could not parse trail metadata for %s: %s", fallback_name, exc)
+        return title, description
+
+    if isinstance(payload, dict):
+        title = str(payload.get("title") or title).strip() or title
+        description = str(payload.get("description") or "").strip()
+    return title, description
+
+
+def parse_seed_metadata(seed_dir: Path) -> tuple[str, str]:
+    metadata_path = seed_dir / "trail.json"
+    if not metadata_path.exists():
+        return humanize_seed_name(seed_dir.name), ""
+
+    try:
+        return parse_seed_metadata_text(metadata_path.read_text(encoding="utf-8"), seed_dir.name)
+    except OSError as exc:
+        LOGGER.warning("Could not read trail metadata from %s: %s", metadata_path, exc)
+        return humanize_seed_name(seed_dir.name), ""
+
+
+def iter_seed_document_paths(seed_dir: Path) -> list[Path]:
+    ignored_names = {"trail.json", ".ds_store"}
+    supported_suffixes = {".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp"}
+    return [
+        path
+        for path in sorted(seed_dir.iterdir())
+        if path.is_file()
+        and path.name.lower() not in ignored_names
+        and path.suffix.lower() in supported_suffixes
+    ]
+
+
+def supported_trail_suffixes() -> set[str]:
+    return {".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp"}
+
+
+def parse_precomputed_payload(
+    raw_text: str,
+    fallback_name: str,
+    default_title: str,
+    default_description: str,
+) -> tuple[str, str, str, str, list[tuple[str, str, str]]]:
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid prepared.json for {fallback_name}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=f"prepared.json for {fallback_name} must be a JSON object.")
+
+    title = str(payload.get("title") or default_title).strip() or default_title
+    description = str(payload.get("description") or default_description).strip()
+    material_text = normalize_text(str(payload.get("material_text") or payload.get("text") or ""))
+    material_preview = normalize_text(str(payload.get("material_preview") or ""))
+
+    document_entries: list[tuple[str, str, str]] = []
+    documents_payload = payload.get("documents")
+    if isinstance(documents_payload, list):
+        for index, item in enumerate(documents_payload, start=1):
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("filename") or f"prepared-doc-{index}.txt").strip()
+            mime_type = str(item.get("mime_type") or "text/plain").strip() or "text/plain"
+            content_text = normalize_text(str(item.get("content_text") or item.get("text") or ""))
+            if content_text:
+                document_entries.append((filename, mime_type, content_text))
+
+    if not material_text and document_entries:
+        material_text = normalize_text(
+            "\n\n".join(f"Document: {filename}\n\n{content_text}" for filename, _, content_text in document_entries)
+        )
+
+    if not material_text:
+        raise HTTPException(
+            status_code=400,
+            detail=f"prepared.json for {fallback_name} must include material_text, text, or non-empty documents.",
+        )
+
+    if not document_entries:
+        document_entries = build_document_tuples_from_material_text(material_text, PRECOMPUTED_JSON_ARTIFACT)
+
+    if not material_preview:
+        material_preview = preview_text(material_text)
+
+    return title, description, material_text, material_preview, document_entries
+
+
+def load_local_precomputed_artifact(
+    seed_dir: Path,
+    fallback_name: str,
+    default_title: str,
+    default_description: str,
+) -> tuple[str, str, str, str, list[tuple[str, str, str]]] | None:
+    prepared_json_path = seed_dir / PRECOMPUTED_JSON_ARTIFACT
+    if prepared_json_path.exists():
+        try:
+            return parse_precomputed_payload(
+                prepared_json_path.read_text(encoding="utf-8"),
+                fallback_name,
+                default_title,
+                default_description,
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Could not read {prepared_json_path}: {exc}") from exc
+
+    for artifact_name in PRECOMPUTED_TEXT_ARTIFACTS:
+        artifact_path = seed_dir / artifact_name
+        if artifact_path.exists():
+            try:
+                material_text = normalize_text(artifact_path.read_text(encoding="utf-8"))
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail=f"Could not read {artifact_path}: {exc}") from exc
+            if not material_text:
+                raise HTTPException(status_code=400, detail=f"{artifact_path} was empty.")
+            documents = build_document_tuples_from_material_text(material_text, artifact_name)
+            return default_title, default_description, material_text, preview_text(material_text), documents
+
+    return None
+
+
+async def sync_parsed_documents_into_trail(
+    client,
+    trail_store: TrailStore,
+    trail_id: str,
+    parsed_documents: list[tuple[str, str, str]],
+):
+    if not parsed_documents:
+        raise HTTPException(status_code=400, detail="No readable material exists in this trail yet.")
+
+    trail_store.clear_trail_documents(trail_id)
+    for filename, mime_type, material in parsed_documents:
+        trail_store.add_document(trail_id, filename, mime_type, material)
+
+    updated_trail, documents = await refresh_trail_material(client, trail_store, trail_id)
+    return updated_trail, documents
+
+
+def sync_precomputed_material_into_trail(
+    trail_store: TrailStore,
+    trail_id: str,
+    material_text: str,
+    material_preview: str,
+    documents: list[tuple[str, str, str]],
+):
+    trail_store.clear_trail_documents(trail_id)
+    for filename, mime_type, content_text in documents:
+        trail_store.add_document(trail_id, filename, mime_type, content_text)
+
+    updated_trail = trail_store.update_trail_material(trail_id, material_text, material_preview)
+    if updated_trail is None:
+        raise HTTPException(status_code=404, detail="Trail not found.")
+    return updated_trail, trail_store.get_trail_documents(trail_id)
+
+
+async def seed_trails_from_directory(client, trail_store: TrailStore, root_dir: Path):
+    if not root_dir.exists():
+        LOGGER.info("Preset trail seed directory %s does not exist yet; skipping preload.", root_dir)
+        return
+
+    seeded_count = 0
+    for seed_dir in sorted(path for path in root_dir.iterdir() if path.is_dir()):
+        document_paths = iter_seed_document_paths(seed_dir)
+        if not document_paths:
+            LOGGER.info("Seed trail %s has no supported documents; skipping.", seed_dir.name)
+            continue
+
+        title, description = parse_seed_metadata(seed_dir)
+        trail = trail_store.upsert_seed_trail(seed_key=seed_dir.name, title=title, description=description)
+        precomputed_artifact = load_local_precomputed_artifact(
+            seed_dir,
+            seed_dir.name,
+            trail.title,
+            trail.description,
+        )
+        if precomputed_artifact is not None:
+            artifact_title, artifact_description, material_text, material_preview, documents = precomputed_artifact
+            trail = trail_store.upsert_seed_trail(
+                seed_key=seed_dir.name,
+                title=artifact_title,
+                description=artifact_description,
+            )
+            sync_precomputed_material_into_trail(
+                trail_store,
+                trail.id,
+                material_text,
+                material_preview,
+                documents,
+            )
+            seeded_count += 1
+            continue
+
+        parsed_documents: list[tuple[str, str, str]] = []
+
+        for document_path in document_paths:
+            mime_type, _ = mimetypes.guess_type(document_path.name)
+            if document_path.suffix.lower() == ".md" and not mime_type:
+                mime_type = "text/markdown"
+            try:
+                material = await prepare_material_bytes(
+                    client,
+                    document_path.read_bytes(),
+                    document_path.name,
+                    mime_type or "application/octet-stream",
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to seed document %s: %s", document_path, exc)
+                continue
+
+            parsed_documents.append(
+                (
+                    document_path.name,
+                    mime_type or "application/octet-stream",
+                    material,
+                )
+            )
+
+        if not parsed_documents:
+            LOGGER.warning("Seed trail %s produced no readable documents.", seed_dir.name)
+            continue
+
+        try:
+            await sync_parsed_documents_into_trail(client, trail_store, trail.id, parsed_documents)
+        except Exception as exc:
+            LOGGER.warning("Failed to refresh seeded trail %s: %s", seed_dir.name, exc)
+            continue
+
+        seeded_count += 1
+
+    LOGGER.info("Seeded %d preset trail(s) from %s", seeded_count, root_dir)
+
+
+def gcs_prefix_for_listing(seed_key: str | None = None) -> str:
+    prefix = PRESET_TRAILS_GCS_PREFIX.strip("/")
+    if seed_key:
+        prefix = f"{prefix}/{seed_key.strip('/')}" if prefix else seed_key.strip("/")
+    return f"{prefix}/" if prefix else ""
+
+
+async def list_gcs_blobs(storage_client, bucket_name: str, prefix: str):
+    return await asyncio.to_thread(lambda: list(storage_client.list_blobs(bucket_name, prefix=prefix)))
+
+
+async def download_gcs_blob_bytes(blob) -> bytes:
+    return await asyncio.to_thread(blob.download_as_bytes)
+
+
+async def load_gcs_precomputed_artifact(
+    trail_blobs: list[Any],
+    current_seed_key: str,
+    default_title: str,
+    default_description: str,
+) -> tuple[str, str, str, str, list[tuple[str, str, str]]] | None:
+    blobs_by_filename = {Path(blob.name).name: blob for blob in trail_blobs}
+
+    if PRECOMPUTED_JSON_ARTIFACT in blobs_by_filename:
+        payload_bytes = await download_gcs_blob_bytes(blobs_by_filename[PRECOMPUTED_JSON_ARTIFACT])
+        return parse_precomputed_payload(
+            payload_bytes.decode("utf-8", errors="ignore"),
+            current_seed_key,
+            default_title,
+            default_description,
+        )
+
+    for artifact_name in PRECOMPUTED_TEXT_ARTIFACTS:
+        if artifact_name not in blobs_by_filename:
+            continue
+        material_text = normalize_text(
+            (await download_gcs_blob_bytes(blobs_by_filename[artifact_name])).decode("utf-8", errors="ignore")
+        )
+        if not material_text:
+            raise HTTPException(status_code=400, detail=f"{artifact_name} for {current_seed_key} was empty.")
+        documents = build_document_tuples_from_material_text(material_text, artifact_name)
+        return default_title, default_description, material_text, preview_text(material_text), documents
+
+    return None
+
+
+async def list_gcs_source_documents(storage_client, bucket_name: str, seed_key: str) -> list[SourceDocument]:
+    blobs = await list_gcs_blobs(storage_client, bucket_name, gcs_prefix_for_listing(seed_key))
+    documents: list[SourceDocument] = []
+    for blob in sorted(blobs, key=lambda item: item.name):
+        filename = Path(blob.name).name
+        safe_name = safe_document_name(filename)
+        if safe_name is None or Path(safe_name).suffix.lower() != ".pdf":
+            continue
+        documents.append(
+            SourceDocument(
+                name=safe_name,
+                label=pdf_label_from_filename(safe_name),
+                mime_type=blob.content_type or "application/pdf",
+            )
+        )
+    return documents
+
+
+def list_local_source_documents(seed_key: str) -> list[SourceDocument]:
+    seed_dir = PRESET_TRAILS_DIR / seed_key
+    if not seed_dir.exists():
+        return []
+
+    documents: list[SourceDocument] = []
+    for path in sorted(seed_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() != ".pdf":
+            continue
+        documents.append(
+            SourceDocument(
+                name=path.name,
+                label=pdf_label_from_filename(path.name),
+                mime_type=mimetypes.guess_type(path.name)[0] or "application/pdf",
+            )
+        )
+    return documents
+
+
+async def get_source_documents_for_trail(app_state, trail: TrailRecord) -> list[SourceDocument]:
+    if not trail.seed_key:
+        return []
+    if app_state.gcs_client is not None and PRESET_TRAILS_GCS_BUCKET:
+        return await list_gcs_source_documents(app_state.gcs_client, PRESET_TRAILS_GCS_BUCKET, trail.seed_key)
+    return list_local_source_documents(trail.seed_key)
+
+
+async def download_trail_pdf_bytes(app_state, trail: TrailRecord, filename: str) -> bytes:
+    safe_name = safe_document_name(filename)
+    if safe_name is None or Path(safe_name).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Only PDF source documents can be viewed.")
+    if not trail.seed_key:
+        raise HTTPException(status_code=404, detail="No source documents are available for this trail.")
+
+    allowed_documents = await get_source_documents_for_trail(app_state, trail)
+    if safe_name not in {document.name for document in allowed_documents}:
+        raise HTTPException(status_code=404, detail="Source document not found.")
+
+    if app_state.gcs_client is not None and PRESET_TRAILS_GCS_BUCKET:
+        blob_name = f"{gcs_prefix_for_listing(trail.seed_key)}{safe_name}"
+        bucket = app_state.gcs_client.bucket(PRESET_TRAILS_GCS_BUCKET)
+        blob = bucket.blob(blob_name)
+        if not await asyncio.to_thread(blob.exists):
+            raise HTTPException(status_code=404, detail="Source document not found.")
+        return await download_gcs_blob_bytes(blob)
+
+    local_path = PRESET_TRAILS_DIR / trail.seed_key / safe_name
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="Source document not found.")
+    return local_path.read_bytes()
+
+
+async def sync_trails_from_gcs(
+    client,
+    trail_store: TrailStore,
+    storage_client,
+    bucket_name: str,
+    seed_key: str | None = None,
+):
+    prefix = gcs_prefix_for_listing(seed_key)
+    blobs = await list_gcs_blobs(storage_client, bucket_name, prefix)
+    if not blobs:
+        LOGGER.info("No preset trail objects found in gs://%s/%s", bucket_name, prefix)
+        return []
+
+    grouped_blobs: dict[str, list[Any]] = defaultdict(list)
+    supported_suffixes = supported_trail_suffixes()
+    for blob in blobs:
+        relative_name = blob.name[len(prefix) :] if prefix else blob.name
+        if not relative_name or relative_name.endswith("/"):
+            continue
+        current_seed_key, separator, child_name = relative_name.partition("/")
+        if not separator or not child_name:
+            continue
+        grouped_blobs[current_seed_key].append(blob)
+
+    synced_trails = []
+    for current_seed_key in sorted(grouped_blobs.keys()):
+        trail_blobs = sorted(grouped_blobs[current_seed_key], key=lambda item: item.name)
+        metadata_blob = next((blob for blob in trail_blobs if Path(blob.name).name == "trail.json"), None)
+
+        if metadata_blob is not None:
+            metadata_bytes = await download_gcs_blob_bytes(metadata_blob)
+            title, description = parse_seed_metadata_text(metadata_bytes.decode("utf-8", errors="ignore"), current_seed_key)
+        else:
+            title, description = humanize_seed_name(current_seed_key), ""
+
+        trail = trail_store.upsert_seed_trail(seed_key=current_seed_key, title=title, description=description)
+        precomputed_artifact = await load_gcs_precomputed_artifact(
+            trail_blobs,
+            current_seed_key,
+            trail.title,
+            trail.description,
+        )
+        if precomputed_artifact is not None:
+            artifact_title, artifact_description, material_text, material_preview, documents = precomputed_artifact
+            trail = trail_store.upsert_seed_trail(
+                seed_key=current_seed_key,
+                title=artifact_title,
+                description=artifact_description,
+            )
+            updated_trail, stored_documents = sync_precomputed_material_into_trail(
+                trail_store,
+                trail.id,
+                material_text,
+                material_preview,
+                documents,
+            )
+            synced_trails.append(
+                {
+                    "id": updated_trail.id,
+                    "seed_key": current_seed_key,
+                    "title": updated_trail.title,
+                    "description": updated_trail.description,
+                    "document_count": len(stored_documents),
+                    "material_preview": updated_trail.material_preview,
+                }
+            )
+            continue
+
+        parsed_documents: list[tuple[str, str, str]] = []
+
+        for blob in trail_blobs:
+            filename = Path(blob.name).name
+            suffix = Path(filename).suffix.lower()
+            if filename == "trail.json" or suffix not in supported_suffixes:
+                continue
+
+            mime_type = blob.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            try:
+                material = await prepare_material_bytes(
+                    client,
+                    await download_gcs_blob_bytes(blob),
+                    filename,
+                    mime_type,
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to ingest GCS preset document %s: %s", blob.name, exc)
+                continue
+
+            parsed_documents.append((filename, mime_type, material))
+
+        if not parsed_documents:
+            LOGGER.warning("GCS preset trail %s produced no readable documents.", current_seed_key)
+            continue
+
+        updated_trail, documents = await sync_parsed_documents_into_trail(
+            client,
+            trail_store,
+            trail.id,
+            parsed_documents,
+        )
+        synced_trails.append(
+            {
+                "id": updated_trail.id,
+                "seed_key": current_seed_key,
+                "title": updated_trail.title,
+                "description": updated_trail.description,
+                "document_count": len(documents),
+                "material_preview": updated_trail.material_preview,
+            }
+        )
+
+    LOGGER.info("Synced %d preset trail(s) from gs://%s/%s", len(synced_trails), bucket_name, prefix)
+    return synced_trails
 
 
 def clamp_score(value: Any) -> int:
@@ -469,7 +1025,19 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup():
     app.state.client = build_client()
+    app.state.gcs_client = build_gcs_client()
     app.state.store = SessionStore()
+    app.state.trails = TrailStore(TRAILS_DB_PATH)
+    if PRESET_TRAILS_AUTO_SYNC:
+        if app.state.gcs_client is not None and PRESET_TRAILS_GCS_BUCKET:
+            await sync_trails_from_gcs(
+                app.state.client,
+                app.state.trails,
+                app.state.gcs_client,
+                PRESET_TRAILS_GCS_BUCKET,
+            )
+        elif PRESET_TRAILS_DIR.exists():
+            await seed_trails_from_directory(app.state.client, app.state.trails, PRESET_TRAILS_DIR)
 
 
 @app.post("/api/upload")
@@ -477,34 +1045,9 @@ async def upload_material(
     file: UploadFile | None = File(default=None),
     text: str | None = Form(default=None),
 ):
-    if file is None and not (text or "").strip():
-        raise HTTPException(status_code=400, detail="Provide a file or pasted text.")
-
-    client = app.state.client
-
-    if (text or "").strip():
-        material = await maybe_summarize_material(client, normalize_text(text or ""))
-    else:
-        file_bytes = await file.read()
-        if len(file_bytes) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=400, detail="File too large. Keep uploads under 10MB.")
-        try:
-            material = await parse_material(client, file_bytes, file.filename or "upload", file.content_type or "")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if not material:
-        raise HTTPException(status_code=400, detail="Could not prepare study material from that input.")
-
-    session_id = str(uuid.uuid4())
-    record = SessionRecord(session_id=session_id, material=material, material_preview=preview_text(material))
-    await app.state.store.set(record)
-
-    return {
-        "session_id": session_id,
-        "material_preview": record.material_preview,
-        "material_text": record.material,
-    }
+    material = await prepare_material_input(app.state.client, file=file, text=text)
+    record = await create_prepared_session(app.state.store, material)
+    return build_session_payload(record)
 
 
 @app.post("/api/topic")
@@ -514,14 +1057,8 @@ async def topic_material(payload: TopicPayload):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    session_id = str(uuid.uuid4())
-    record = SessionRecord(session_id=session_id, material=material, material_preview=preview_text(material))
-    await app.state.store.set(record)
-    return {
-        "session_id": session_id,
-        "material_preview": record.material_preview,
-        "material_text": record.material,
-    }
+    record = await create_prepared_session(app.state.store, material)
+    return build_session_payload(record)
 
 
 @app.get("/api/personas")
@@ -534,12 +1071,155 @@ async def get_modes():
     return list_modes()
 
 
-@app.get("/api/sample-material")
-async def get_sample_material():
-    sample_options = get_sample_material_options()
-    if not sample_options:
-        raise HTTPException(status_code=404, detail="Sample material is not configured.")
-    return {"options": sample_options}
+@app.post("/api/admin/trails")
+async def create_trail(payload: TrailCreatePayload):
+    trail = app.state.trails.create_trail(payload.title, payload.description)
+    return {
+        "id": trail.id,
+        "title": trail.title,
+        "description": trail.description,
+        "material_preview": trail.material_preview,
+        "document_count": 0,
+    }
+
+
+@app.post("/api/admin/trails/{trail_id}/documents")
+async def add_trail_document(
+    trail_id: str,
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    filename: str | None = Form(default=None),
+):
+    trail = app.state.trails.get_trail(trail_id)
+    if trail is None:
+        raise HTTPException(status_code=404, detail="Trail not found.")
+
+    material = await prepare_material_input(app.state.client, file=file, text=text)
+    inferred_filename = filename or (file.filename if file else None) or f"document-{len(app.state.trails.get_trail_documents(trail_id)) + 1}.txt"
+    inferred_mime = file.content_type if file else "text/plain"
+    app.state.trails.add_document(trail_id, inferred_filename, inferred_mime or "text/plain", material)
+    updated_trail, documents = await refresh_trail_material(app.state.client, app.state.trails, trail_id)
+
+    return {
+        "trail": {
+            "id": updated_trail.id,
+            "title": updated_trail.title,
+            "description": updated_trail.description,
+            "material_preview": updated_trail.material_preview,
+            "material_text": updated_trail.merged_material,
+        },
+        "documents": [
+            {
+                "id": document.id,
+                "filename": document.filename,
+                "mime_type": document.mime_type,
+                "created_at": document.created_at,
+            }
+            for document in documents
+        ],
+    }
+
+
+@app.get("/api/admin/trails/{trail_id}")
+async def get_trail_detail(trail_id: str):
+    trail = app.state.trails.get_trail(trail_id)
+    if trail is None:
+        raise HTTPException(status_code=404, detail="Trail not found.")
+    documents = app.state.trails.get_trail_documents(trail_id)
+    return {
+        "id": trail.id,
+        "title": trail.title,
+        "description": trail.description,
+        "material_preview": trail.material_preview,
+        "material_text": trail.merged_material,
+        "documents": [
+            {
+                "id": document.id,
+                "filename": document.filename,
+                "mime_type": document.mime_type,
+                "created_at": document.created_at,
+            }
+            for document in documents
+        ],
+    }
+
+
+@app.post("/api/admin/trails/sync-gcs")
+async def sync_gcs_preset_trails(seed_key: str | None = None):
+    if app.state.gcs_client is None or not PRESET_TRAILS_GCS_BUCKET:
+        raise HTTPException(
+            status_code=400,
+            detail="GCS preset trail sync is not configured. Set PRESET_TRAILS_GCS_BUCKET first.",
+        )
+
+    trails = await sync_trails_from_gcs(
+        app.state.client,
+        app.state.trails,
+        app.state.gcs_client,
+        PRESET_TRAILS_GCS_BUCKET,
+        seed_key=seed_key,
+    )
+    return {
+        "bucket": PRESET_TRAILS_GCS_BUCKET,
+        "prefix": PRESET_TRAILS_GCS_PREFIX,
+        "synced_count": len(trails),
+        "trails": trails,
+    }
+
+
+@app.get("/api/preset-trails")
+async def get_preset_trails():
+    trails = app.state.trails.list_trails()
+    ready_trails = [trail for trail in trails if trail.merged_material.strip()]
+    return {
+        "trails": [
+            {
+                "id": trail.id,
+                "title": trail.title,
+                "description": trail.description,
+                "material_preview": trail.material_preview,
+            }
+            for trail in ready_trails
+        ]
+    }
+
+
+@app.post("/api/preset-trails/{trail_id}/prepare")
+async def prepare_preset_trail(trail_id: str):
+    trail = app.state.trails.get_trail(trail_id)
+    if trail is None:
+        raise HTTPException(status_code=404, detail="Trail not found.")
+    if not trail.merged_material.strip():
+        raise HTTPException(status_code=400, detail="This trail does not have any prepared material yet.")
+
+    record = await create_prepared_session(app.state.store, trail.merged_material)
+    payload = build_session_payload(record)
+    source_documents = await get_source_documents_for_trail(app.state, trail)
+    payload["source_documents"] = [
+        {
+            "name": document.name,
+            "label": document.label,
+            "mime_type": document.mime_type,
+            "view_url": f"/api/preset-trails/{trail.id}/documents/{quote(document.name)}",
+        }
+        for document in source_documents
+    ]
+    return payload
+
+
+@app.get("/api/preset-trails/{trail_id}/documents/{filename}")
+async def view_preset_trail_document(trail_id: str, filename: str):
+    trail = app.state.trails.get_trail(trail_id)
+    if trail is None:
+        raise HTTPException(status_code=404, detail="Trail not found.")
+
+    pdf_bytes = await download_trail_pdf_bytes(app.state, trail, filename)
+    safe_name = Path(filename).name
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
 
 
 @app.get("/health")

@@ -1,15 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import FileUpload from '../components/FileUpload';
 import ModePicker from '../components/ModePicker';
 import PersonaPicker from '../components/PersonaPicker';
 import { getApiBaseUrl } from '../lib/api';
 
 const MATERIAL_TABS = [
-  { id: 'upload', label: 'Upload file' },
+  { id: 'preset', label: 'Preset' },
   { id: 'text', label: 'Paste text' },
   { id: 'topic', label: 'Quick topic' },
-  { id: 'preset', label: 'Preset' },
 ];
 
 const STEP_LABELS = [
@@ -19,17 +17,18 @@ const STEP_LABELS = [
   { id: 4, eyebrow: 'Step 4', title: 'Launch the session' },
 ];
 
-function getMaterialStatus(materialTab, selectedFile, textMaterial, topic) {
-  if (materialTab === 'upload') {
-    return selectedFile ? selectedFile.name : 'Pick a file to prepare';
-  }
+function getMaterialStatus(materialTab, textMaterial, topic) {
   if (materialTab === 'text') {
     return textMaterial.trim() ? 'Text material loaded' : 'Paste notes or use a preset';
   }
   if (materialTab === 'preset') {
-    return textMaterial.trim() ? 'Preset material loaded' : 'Choose a ready-made preset';
+    return 'Choose a ready-made preset';
   }
   return topic.trim() ? topic.trim() : 'Enter a topic to generate study material';
+}
+
+function getPresetStatus(selectedPreset) {
+  return selectedPreset ? selectedPreset.title : 'Choose a ready-made preset trail';
 }
 
 export default function Setup({
@@ -43,37 +42,37 @@ export default function Setup({
   onSelectPersona,
   onStart,
 }) {
-  const [materialTab, setMaterialTab] = useState('upload');
-  const [selectedFile, setSelectedFile] = useState(null);
+  const [materialTab, setMaterialTab] = useState('preset');
   const [textMaterial, setTextMaterial] = useState('');
   const [topic, setTopic] = useState('');
   const [topicDescription, setTopicDescription] = useState('');
   const [error, setError] = useState('');
   const [sampleLoading, setSampleLoading] = useState(false);
-  const [sampleOptions, setSampleOptions] = useState([]);
+  const [presetTrails, setPresetTrails] = useState([]);
+  const [selectedPresetTrailId, setSelectedPresetTrailId] = useState('');
   const [activeStep, setActiveStep] = useState(1);
 
   useEffect(() => {
     let cancelled = false;
 
-    const loadSampleOptions = async () => {
+    const loadPresetTrails = async () => {
       try {
         setSampleLoading(true);
-        const response = await fetch(`${getApiBaseUrl()}/api/sample-material`);
+        const response = await fetch(`${getApiBaseUrl()}/api/preset-trails`);
         if (!response.ok) {
           if (response.status !== 404) {
             const payload = await response.json().catch(() => ({}));
-            throw new Error(payload.detail || 'Could not load sample material.');
+            throw new Error(payload.detail || 'Could not load preset trails.');
           }
           if (!cancelled) {
-            setSampleOptions([]);
+            setPresetTrails([]);
           }
           return;
         }
 
         const data = await response.json();
         if (!cancelled) {
-          setSampleOptions(Array.isArray(data.options) ? data.options : []);
+          setPresetTrails(Array.isArray(data.trails) ? data.trails : []);
         }
       } catch (loadError) {
         if (!cancelled) {
@@ -86,7 +85,7 @@ export default function Setup({
       }
     };
 
-    loadSampleOptions();
+    loadPresetTrails();
     return () => {
       cancelled = true;
     };
@@ -108,34 +107,9 @@ export default function Setup({
     setActiveStep(4);
   }, [preparedSession?.session_id, selectedModeId, selectedPersonaId]);
 
-  const loadSampleMaterial = (sampleText) => {
-    setError('');
-    setMaterialTab('preset');
-    setSelectedFile(null);
-    setTextMaterial(sampleText || '');
-  };
-
   const materialMutation = useMutation({
     mutationFn: async () => {
       const apiBaseUrl = getApiBaseUrl();
-
-      if (materialTab === 'upload') {
-        if (!selectedFile) {
-          throw new Error('Choose a file first.');
-        }
-
-        const formData = new FormData();
-        formData.append('file', selectedFile);
-
-        const response = await fetch(`${apiBaseUrl}/api/upload`, {
-          method: 'POST',
-          body: formData,
-        });
-        if (!response.ok) {
-          throw new Error((await response.json()).detail || 'Upload failed.');
-        }
-        return response.json();
-      }
 
       if (materialTab === 'text') {
         if (!textMaterial.trim()) {
@@ -156,16 +130,11 @@ export default function Setup({
       }
 
       if (materialTab === 'preset') {
-        if (!textMaterial.trim()) {
+        if (!selectedPresetTrailId) {
           throw new Error('Choose a preset first.');
         }
-
-        const formData = new FormData();
-        formData.append('text', textMaterial);
-
-        const response = await fetch(`${apiBaseUrl}/api/upload`, {
+        const response = await fetch(`${apiBaseUrl}/api/preset-trails/${selectedPresetTrailId}/prepare`, {
           method: 'POST',
-          body: formData,
         });
         if (!response.ok) {
           throw new Error((await response.json()).detail || 'Preset preparation failed.');
@@ -213,11 +182,14 @@ export default function Setup({
   const canStart = Boolean(preparedSession?.session_id && selectedModeId && selectedPersonaId);
   const selectedMode = modes.find((item) => item.id === selectedModeId) || null;
   const selectedPersona = personas.find((item) => item.id === selectedPersonaId) || null;
+  const selectedPreset = presetTrails.find((item) => item.id === selectedPresetTrailId) || null;
 
-  const materialStatus = useMemo(
-    () => getMaterialStatus(materialTab, selectedFile, textMaterial, topic),
-    [materialTab, selectedFile, textMaterial, topic],
-  );
+  const materialStatus = useMemo(() => {
+    if (materialTab === 'preset') {
+      return getPresetStatus(selectedPreset);
+    }
+    return getMaterialStatus(materialTab, textMaterial, topic);
+  }, [materialTab, selectedPreset, textMaterial, topic]);
 
   const summaryLabel = useMemo(() => {
     if (!preparedSession) {
@@ -333,15 +305,11 @@ export default function Setup({
 
               {sampleLoading ? (
                 <div className="mt-6 rounded-[1.5rem] border border-ink/10 bg-sand/70 px-4 py-3 text-sm text-ink/65">
-                  Loading sample material options...
+                  Loading preset trails...
                 </div>
               ) : null}
 
               <div className="mt-6">
-                {materialTab === 'upload' ? (
-                  <FileUpload disabled={materialMutation.isPending} onSelect={setSelectedFile} />
-                ) : null}
-
                 {materialTab === 'text' ? (
                   <div className="rounded-[2rem] border border-white/70 bg-white/75 p-6 shadow-glow">
                     <label className="text-xs uppercase tracking-[0.28em] text-moss/70">Paste notes or transcript</label>
@@ -383,30 +351,33 @@ export default function Setup({
                       <div>
                         <label className="text-xs uppercase tracking-[0.28em] text-moss/70">Choose a preset topic</label>
                         <p className="mt-2 text-sm leading-6 text-ink/70">
-                          Ready-made material for quick demos and judge testing.
+                          Pick from saved document trails that were preloaded before the demo.
                         </p>
                       </div>
                     </div>
                     <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                      {sampleOptions.map((option) => (
+                      {presetTrails.map((trail) => (
                         <button
-                          key={option.id}
+                          key={trail.id}
                           type="button"
-                          onClick={() => loadSampleMaterial(option.text)}
+                          onClick={() => {
+                            setError('');
+                            setSelectedPresetTrailId(trail.id);
+                          }}
                           disabled={materialMutation.isPending}
                           className={`rounded-[1.6rem] border p-4 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${
-                            textMaterial === option.text
+                            selectedPresetTrailId === trail.id
                               ? 'border-orange bg-[#fff5ed]'
                               : 'border-ink/10 bg-sand/70 hover:-translate-y-0.5 hover:border-orange hover:bg-[#fff5ed]'
                           }`}
                         >
-                          <p className="font-semibold text-ink">{option.label}</p>
-                          <p className="mt-2 text-sm leading-6 text-ink/65">{option.preview}</p>
+                          <p className="font-semibold text-ink">{trail.title}</p>
+                          {trail.description ? <p className="mt-2 text-sm leading-6 text-ink/70">{trail.description}</p> : null}
                         </button>
                       ))}
                     </div>
-                    {!sampleOptions.length && !sampleLoading ? (
-                      <p className="mt-4 text-sm text-ink/60">No presets are configured right now.</p>
+                    {!presetTrails.length && !sampleLoading ? (
+                      <p className="mt-4 text-sm text-ink/60">No preset trails are loaded yet.</p>
                     ) : null}
                   </div>
                 ) : null}
@@ -416,7 +387,6 @@ export default function Setup({
                 <div className="text-sm leading-6 text-ink/70">
                   <p className="font-semibold text-ink">Current material input</p>
                   <p>{materialStatus}</p>
-                  {selectedFile ? <p className="text-xs text-ink/55">Selected file: {selectedFile.name}</p> : null}
                 </div>
                 <button
                   type="button"

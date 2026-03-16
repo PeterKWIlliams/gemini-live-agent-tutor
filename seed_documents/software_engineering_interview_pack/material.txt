@@ -1,0 +1,263 @@
+Document: mit_complexity.pdf
+
+Introduction to Algorithms: 6.006 
+Massachusetts Institute of Technology 
+Instructors: Erik Demaine, Jason Ku, and Justin Solomon Lecture 19: Complexity 
+Lecture 19: Complexity 
+Decision Problems 
+• Decision problem: assignment of inputs to YES (1) or NO (0) 
+• Inputs are either NO inputs or YES inputs 
+Problem 
+s-t Shortest Path Does a given G contain a path from s to t with weight at most d? 
+Negative Cycle Does a given G contain a negative weight cycle? 
+Longest Simple Path Does a given G contain a simple path with weight at least d? 
+Subset Sum Does a given set of integers A contain a subset with sum S ? 
+Tetris Can you survive a given sequence of pieces in given board? 
+Chess Can a player force a win from a given board? 
+Halting problem Does a given computer program terminate for a given input? Decision 
+• Algorithm/Program: constant-length code (working on a word-RAM with Ω(log n)-bit 
+words) to solve a problem, i.e., it produces correct output for every input and the length 
+of the code is independent of the instance size 
+• Problem is decidable if there exists a program to solve the problem in ﬁnite time 
+Decidability 
+• Program is ﬁnite (constant) string of bits, i.e., a nonnegative integer ∈ N. 
+Problem is function p : N →{0, 1}, i.e., inﬁnite string of bits. 
+• (# of programs |N|, countably inﬁnite) ^\ (# of problems |R|, uncountably inﬁnite) 
+• (Proof by Cantor’s diagonalization argument, probably covered in 6.042) 
+• Proves that most decision problems not solvable by any program (undecidable) 
+• E.g., the Halting problem is undecidable (many awesome proofs in 6.045) 
+• Fortunately most problems we think of are algorithmic in structure and are decidable 
+Decidable Decision Problems 
+R problems decidable in ﬁnite time (‘R’ comes from recursive languages) 
+EXP problems decidable in exponential time 2nO(1) (most problems we think of are here) 
+P problems decidable in polynomial time nO(1) (efﬁcient algorithms, the focus of this class) 
+• These sets are distinct, i.e., P $ EXP $ R (via time hierarchy theorems, see 6.045) 
+• E.g., Chess is in EXP \ P 
+
+2 Lecture 19: Complexity 
+Nondeterministic Polynomial Time (NP) 
+• P is the set of decision problems for which there is an algorithm A such that, for every input 
+I of size n , A on I runs in poly(n ) time and solves I correctly 
+• NP is the set of decision problems for which there is a veriﬁcation algorithm V that takes as 
+input an input I of the problem and a certiﬁcate bit string of length polynomial in the size 
+of I, so that: 
+– V always runs in time polynomial in the size of I ; 
+– if I is a YES input, then there is some certiﬁcate c so that V outputs YES on input (I, c); 
+and 
+– if I is a NO input, then no matter what certiﬁcate c we choose, V always output NO on 
+input (I, c). 
+• You can think of the certiﬁcate as a proof that I is a YES input. 
+If I is actually a NO input, then no proof should work. 
+Problem Certiﬁcate Veriﬁer 
+s-t Shortest Path 
+Negative Cycle 
+Longest Simple Path 
+Subset Sum 
+Tetris A path P from s to t 
+A cycle C 
+A path P A set of items A
+0 
+Sequence of moves Adds the weights on P and checks whether ≤ d 
+Adds the weights on C and checks whether < 0 
+Checks whether P is a simple path with weight ≥ d 
+Checks whether A0 ∈ A has sum S 
+Checks that the moves allow survival 
+• P ⊆ NP: The veriﬁer V just solves the instance ignoring any certiﬁcate 
+• NP ⊆ EXP: Try all possible certiﬁcates! At most 2nO(1) of them, run veriﬁer V on all 
+• Open: Does P = NP? NP = EXP? 
+• Most people think P $ NP ($ EXP), i.e., generating solutions harder than checking 
+• If you prove either way, people will give you lots of money ($1M Millennium Prize) 
+• Why do we care? If can show a problem is hardest problem in NP, then problem cannot be solved in polynomial time if P 6= NP 
+• How do we relate difﬁculty of problems? Reductions! 
+
+3 Lecture 19: Complexity 
+Reductions 
+• Suppose you want to solve problem A 
+• One way to solve is to convert A into a problem B you know how to solve 
+• Solve using an algorithm for B and use it to compute solution to A 
+• This is called a reduction from problem A to problem B (A → B) 
+• Because B can be used to solve A, B is at least as hard as A (A ≤ B) 
+• General algorithmic strategy: reduce to a problem you know how to solve 
+A Conversion B 
+Unweighted Shortest Path 
+Integer-weighted Shortest Path Longest Path Give equal weights Subdivide edges Negate weights Weighted Shortest Path Unweighted Shortest Path Shortest Path 
+• Problem A is NP-hard if every problem in NP is polynomially reducible to A 
+• i.e., A is at least as hard as (can be used to solve) every problem in NP (X ≤ A for X ∈ NP) 
+• NP-complete = NP ∩ NP-hard 
+• All NP-complete problems are equivalent, i.e., reducible to each other 
+• First NP-complete problem? Every decision problem reducible to satisfying a logical circuit, 
+a problem called “Circuit SAT”. 
+• Longest Simple Path and Tetris are NP-complete, so if any problem is in NP \ P, these are 
+• Chess is EXP-complete: in EXP and reducible from every problem in EXP (so ∈ / P) 
+
+4 Lecture 19: Complexity 
+Examples of NP-complete Problems 
+• Subset Sum from L18 (“weakly NP-complete” which is what allows a pseudopolynomial-
+time algorithm, but no polynomial algorithm unless P = NP) 
+• 3-Partition: given n integers, can you divide them into triples of equal sum? (“strongly 
+NP-complete”: no pseudopolynomial-time algorithm unless P = NP) 
+• Rectangle Packing: given n rectangles and a target rectangle whose area is the sum of the n 
+rectangle areas, pack without overlap 
+– Reduction from 3-Partition to Rectangle Packing: transform integer ai into 1 × ai rect-P angle; set target rectangle to n/3 × ( i ai) /3 
+• Jigsaw puzzles: given n pieces with possibly ambiguous tabs/pockets, ﬁt the pieces together 
+– Reduction from Rectangle Packing: use uniquely matching tabs/pockets to force build-ing rectangles and rectangular boundary; use one ambiguous tab/pocket for all other boundaries 
+• Longest common subsequence of n strings 
+• Longest simple path in a graph 
+• Traveling Salesman Problem: shortest path that visits all vertices of a given graph (or deci-sion version: is minimum weight ≤ d) 
+• Shortest path amidst obstacles in 3D 
+• 3-coloring given graph (but 2-coloring ∈ P) 
+• Largest clique in a given graph 
+• SAT: given a Boolean formula (made with 
+AND, OR, NOT), is it every true? 
+E.g., x AND NOT x is a NO input 
+• Minesweeper, Sudoku, and most puzzles 
+• Super Mario Bros., Legend of Zelda, Pok ´emon, and most video games are NP-hard (many 
+are harder) 
+
+MIT OpenCourseWare 
+https://ocw.mit.edu 
+6.006 Introduction to Algorithms 
+Spring 20 20 
+For information about citing these materials or our Terms of Use, visit: https://ocw.mit.edu/terms
+
+Document: mit_data_structures.pdf
+
+Introduction to Algorithms: 6.006 
+Massachusetts Institute of Technology 
+Instructors: Erik Demaine, Jason Ku, and Justin Solomon Lecture 2: Data Structures 
+Lecture 2: Data Structures 
+Data Structure Interfaces 
+• A data structure is a way to store data, with algorithms that support operations on the data 
+• Collection of supported operations is called an interface (also API or ADT) 
+• Interface is a speciﬁcation: what operations are supported (the problem!) 
+• Data structure is a representation: how operations are supported (the solution!) 
+• In this class, two main interfaces: Sequence and Set 
+Sequence Interface (L02, L07) 
+• Maintain a sequence of items (order is extrinsic) 
+• Ex: (x0, x1, x2, . . . , x n−1) (zero indexing) 
+• (use n to denote the number of items stored in the data structure) 
+• Supports sequence operations: 
+Container build(X) 
+len() given an iterable X, build sequence from items in X 
+return the number of stored items 
+Static iter seq() 
+get at(i) 
+set at(i, x) return the stored items one-by-one in sequence order 
+return the ith item 
+replace the ith item with x 
+Dynamic insert at(i, x) 
+delete at(i) 
+insert first(x) 
+delete first() 
+insert last(x) 
+delete last() add x as the ith item 
+remove and return the ith item 
+add x as the ﬁrst item remove and return the ﬁrst item add x as the last item remove and return the last item 
+• Special case interfaces: 
+stack 
+insert last(x) and delete last() 
+queue insert last(x) and delete first() 
+
+2 Lecture 2: Data Structures 
+Set Interface (L03-L08) 
+• Sequence about extrinsic order, set is about intrinsic order 
+• Maintain a set of items having unique keys (e.g., item x has key x.key ) 
+• (Set or multi-set? We restrict to unique keys for now.) 
+• Often we let key of an item be the item itself, but may want to store more info than just key 
+• Supports set operations: 
+Container build(X) 
+len() given an iterable X, build sequence from items in X 
+return the number of stored items 
+Static find(k) return the stored item with key k 
+Dynamic insert(x) delete(k) add x to set (replace item with key x.key if one already exists) 
+remove and return the stored item with key k 
+Order iter ord() 
+find min() 
+find max() 
+find next(k) 
+find prev(k) return the stored items one-by-one in key order 
+return the stored item with smallest key return the stored item with largest key return the stored item with smallest key larger than 
+k 
+return the stored item with largest key smaller than k 
+• Special case interfaces: 
+dictionary set without the Order operations 
+• In recitation, you will be asked to implement a Set, given a Sequence data structure. 
+Array Sequence 
+• Array is great for static operations! get at(i) and set at(i, x) in Θ(1) time! 
+• But not so great at dynamic operations... 
+• (For consistency, we maintain the invariant that array is full) 
+• Then inserting and removing items requires: 
+– reallocating the array 
+– shifting all items after the modiﬁed item 
+Data Operation, Worst Case O (·) 
+Container Static Dynamic 
+Structure build(X) get at(i) 
+set at(i,x) insert first(x) 
+delete first() insert last(x) 
+delete last() insert at(i, x) 
+delete at(i) 
+Array n 1 n n n 
+
+3 Lecture 2: Data Structures 
+Linked List Sequence 
+• Pointer data structure (this is not related to a Python “list”) 
+• Each item stored in a node which contains a pointer to the next node in sequence 
+• Each node has two ﬁelds: node.item and node.next 
+• Can manipulate nodes simply by relinking pointers! 
+• Maintain pointers to the ﬁrst node in sequence (called the head) 
+• Can now insert and delete from the front in Θ(1) time! Yay! 
+• (Inserting/deleting efﬁciently from back is also possible; you will do this in PS1) 
+• But now get at(i) and set at(i, x) each take O(n) time... :( 
+• Can we get the best of both worlds? Yes! (Kind of...) 
+Data Operation, Worst Case O (·) 
+Container Static Dynamic 
+Structure build(X) get at(i) 
+set at(i,x) insert first(x) 
+delete first() insert last(x) 
+delete last() insert at(i, x) 
+delete at(i) 
+Linked List n n 1 n n 
+Dynamic Array Sequence 
+• Make an array efﬁcient for last dynamic operations 
+• Python “list” is a dynamic array 
+• Idea! Allocate extra space so reallocation does not occur with every dynamic operation 
+• Fill ratio: 0 ≤ r ≤ 1 the ratio of items to space 
+• Whenever array is full (r =1), allocate Θ(n) extra space at end to ﬁll ratio r i (e.g., 1/2 ) 
+• Will have to insert Θ(n) items before the next reallocation 
+• A single operation can take Θ(n) time for reallocation 
+• However, any sequence of Θ(n) operations takes Θ(n) time 
+• So each operation takes Θ(1) time “on average” 
+
+4 Lecture 2: Data Structures 
+Amortized Analysis 
+• Data structure analysis technique to distribute cost over many operations 
+• Operation has amortized cost T (n) if k operations cost at most ≤ kT (n) 
+• “T (n) amortized” roughly means T (n) “on average” over many operations 
+• Inserting into a dynamic array takes Θ(1) amortized time 
+• More amortization analysis techniques in 6.046! 
+Dynamic Array Deletion 
+• Delete from back? Θ(1) time without effort, yay! 
+• However, can be very wasteful in space. Want size of data structure to stay Θ(n ) 
+• Attempt: if very empty, resize to r =1. Alternating insertion and deletion could be bad... 
+• Idea! When r < r d, resize array to ratio r i where r d < ri (e.g., r d =1/4, ri =1/2) 
+• Then Θ(n) cheap operations must be made before next expensive resize 
+1 rd+1• Can limit extra space usage to (1 + ε)n for any ε > 0 (set r d = , ri = )1+ε 2 
+• Dynamic arrays only support dynamic last operations in Θ(1) time 
+• Python List append and pop are amortized O (1) time, other operations can be O (n)! 
+• (Inserting/deleting efﬁciently from front is also possible; you will do this in PS1) 
+Data Operation, Worst Case O (·) 
+Container Static Dynamic 
+Structure build(X) get at(i) 
+set at(i,x) insert first(x) 
+delete first() insert last(x) 
+delete last() insert at(i, x) 
+delete at(i) 
+Array n 1 n n n 
+Linked List n n 1 n n 
+Dynamic Array n 1 n 1(a) n 
+
+MIT OpenCourseWare 
+https://ocw.mit.edu 
+6.006 Introduction to Algorithms 
+Spring 20 20 
+For information about citing these materials or our Terms of Use, visit: https://ocw.mit.edu/terms

@@ -1,0 +1,137 @@
+This summary integrates the key concepts, definitions, and relationships from the provided documents on supervised learning, regularization, and bias-variance analysis.
+
+---
+
+## Supervised Learning Fundamentals
+
+**Supervised learning** is a machine learning paradigm where an algorithm learns a mapping function ($h: X \to Y$) from a labeled dataset of input-output pairs $\{(x^{(i)}, y^{(i)}); i=1, \dots, n\}$. The goal is to predict an output ($y$) for new, unseen inputs ($x$).
+
+* **Input features ($x^{(i)}$)**: Variables describing the input.
+* **Output/Target variable ($y^{(i)}$)**: The variable to be predicted.
+* **Hypothesis ($h$)**: The learned function.
+
+Supervised learning problems are categorized:
+* **Regression**: $y$ is continuous (e.g., predicting house prices).
+* **Classification**: $y$ is discrete (e.g., predicting spam/not-spam).
+
+### 1. Linear Regression
+
+Linear regression is a model for **regression problems**.
+* **Model Representation**: The hypothesis is a linear function of input features: $h_\theta(x) = \theta^T x$, where $\theta$ are the model parameters (weights) and $x$ includes a bias term $x_0=1$.
+* **Cost Function**: The goal is to find $\theta$ that minimizes the **least-squares cost function** (also known as Ordinary Least Squares or OLS):
+ $J(\theta) = \frac{1}{2} \sum_{i=1}^n (h_\theta(x^{(i)}) - y^{(i)})^2$
+* **LMS Algorithm (Gradient Descent)**: An iterative optimization algorithm to minimize $J(\theta)$. It updates parameters by moving in the direction opposite to the gradient: $\theta_j := \theta_j - \alpha \frac{\partial}{\partial \theta_j} J(\theta)$, where $\alpha$ is the learning rate.
+ * **Batch Gradient Descent**: Updates $\theta$ using the sum of gradients over *all* training examples in each step.
+ * **Stochastic Gradient Descent (SGD)**: Updates $\theta$ for *each individual* training example. Faster initially, but can oscillate near the minimum.
+* **Normal Equations (Closed-Form Solution)**: For linear regression, $\theta$ can be found directly without iteration:
+ $\theta = (X^T X)^{-1} X^T \vec{y}$
+ where $X$ is the design matrix (rows are $x^{(i)T}$) and $\vec{y}$ is the vector of target values. This requires $X^T X$ to be invertible.
+* **Probabilistic Interpretation**: The least-squares cost function is justified by assuming that the target variable $y^{(i)}$ is related to $x^{(i)}$ by $y^{(i)} = \theta^T x^{(i)} + \epsilon^{(i)}$, where the error terms $\epsilon^{(i)}$ are **Independent and Identically Distributed (IID) Gaussian (Normal) random variables** with mean zero and variance $\sigma^2$. Under these assumptions, minimizing $J(\theta)$ is equivalent to **Maximum Likelihood Estimation (MLE)** for $\theta$.
+* **Locally Weighted Linear Regression (LWR)**: A non-parametric algorithm used when a global linear model is insufficient. For a query point $x$, it fits a linear model by minimizing a *weighted* least-squares cost function, giving higher importance to training examples closer to $x$ using weights $w^{(i)} = \exp\left(-\frac{(x^{(i)} - x)^2}{2\tau^2}\right)$, where $\tau$ is the bandwidth parameter.
+
+### 2. Logistic Regression
+
+Logistic regression is a model for **binary classification problems** ($y \in \{0, 1\}$).
+* **Model Representation**: It uses a non-linear hypothesis to ensure outputs are between 0 and 1:
+ $h_\theta(x) = g(\theta^T x) = \frac{1}{1 + e^{-\theta^T x}}$
+ where $g(z)$ is the **logistic (sigmoid) function**.
+* **Probabilistic Interpretation**: $h_\theta(x)$ is interpreted as the conditional probability $P(y=1|x; \theta)$. This leads to a **Bernoulli distribution** for $y|x; \theta$.
+* **Log-Likelihood**: Parameters are learned by maximizing the log-likelihood function:
+ $\ell(\theta) = \sum_{i=1}^n \left[y^{(i)} \log h_\theta(x^{(i)}) + (1 - y^{(i)}) \log(1 - h_\theta(x^{(i)}))\right]$
+* **Gradient Ascent**: To maximize $\ell(\theta)$, gradient ascent is used. The stochastic gradient ascent update rule is:
+ $\theta_j := \theta_j + \alpha (y^{(i)} - h_\theta(x^{(i)})) x_j^{(i)}$
+ This rule has the same form as the LMS update for linear regression, but $h_\theta(x)$ is now the sigmoid function.
+* **Newton's Method**: A faster converging alternative to gradient ascent for maximizing $\ell(\theta)$. For multi-dimensional $\theta$, it's the Newton-Raphson method: $\theta := \theta - H^{-1} \nabla_\theta \ell(\theta)$, where $H$ is the Hessian matrix. This is known as **Fisher scoring** in this context.
+
+### 3. Generalized Linear Models (GLMs)
+
+GLMs provide a unifying framework for deriving various regression and classification models, including linear and logistic regression, based on three core assumptions:
+
+1. **Exponential Family Assumption**: The conditional distribution of the target variable $y$ (given $x$ and $\theta$) belongs to the **exponential family**, a class of distributions that can be written as:
+ $p(y; \eta) = b(y) \exp(\eta^T T(y) - a(\eta))$
+ where $\eta$ is the **natural parameter**, $T(y)$ is the **sufficient statistic** (often $T(y)=y$), and $a(\eta)$ is the **log partition function**.
+ * **Examples**: Bernoulli (for binary classification, $\eta = \log(\phi/(1-\phi))$ where $\phi = E[y]$), Gaussian (for continuous regression, $\eta = \mu$ where $\mu = E[y]$).
+2. **Prediction Target**: The hypothesis $h_\theta(x)$ predicts the expected value of the sufficient statistic $T(y)$ given $x$. Often, $h_\theta(x) = E[y|x]$.
+3. **Linear Relationship**: The natural parameter $\eta$ is a linear function of the input features: $\eta = \theta^T x$.
+
+* **Ordinary Least Squares as a GLM**: Derived by assuming a Gaussian distribution for $y|x$. Here $\eta=\mu$, and combining $\eta=\theta^T x$ with $h_\theta(x)=E[y|x]=\mu$ gives $h_\theta(x) = \theta^T x$.
+* **Logistic Regression as a GLM**: Derived by assuming a Bernoulli distribution for $y|x$. Here $\eta = \log(\phi/(1-\phi))$ where $\phi=E[y]$, which implies $\phi = 1/(1+e^{-\eta})$. Combining with $\eta=\theta^T x$ and $h_\theta(x)=E[y|x]=\phi$ gives $h_\theta(x) = 1/(1+e^{-\theta^T x})$.
+* **Softmax Regression**: An extension for **multi-class classification** ($y \in \{1, \dots, k\}$). It models $y|x$ using a **multinomial distribution**. The hypothesis predicts the probability of each class:
+ $P(y=i|x; \theta) = \frac{e^{\theta_i^T x}}{\sum_{j=1}^k e^{\theta_j^T x}}$
+ where $\theta_j$ are parameter vectors for each class.
+
+---
+
+## Regularization and Model Selection
+
+When fitting models, we aim for a good balance between **bias** (error from overly simplistic assumptions) and **variance** (error from sensitivity to training data fluctuations). This is the **bias-variance tradeoff**. Models that fit the training data too well (high variance) often **overfit**, leading to poor generalization. **Regularization** and **model selection** are techniques to manage this tradeoff.
+
+### 1. Model Selection Techniques
+
+Model selection involves choosing the best model (e.g., polynomial degree, regularization parameter, feature subset) from a set of candidates.
+* **Why not just use training error?** A model with higher complexity (e.g., higher polynomial degree) will always have lower training error but will likely overfit.
+* **Hold-Out Cross Validation**:
+ 1. Randomly split the training set $S$ into $S_{train}$ (e.g., 70%) and $S_{cv}$ (e.g., 30%).
+ 2. Train each candidate model $M_i$ on $S_{train}$.
+ 3. Select the model with the smallest error on $S_{cv}$.
+ Disadvantage: "wastes" a portion of data by not using it for training the selected model directly.
+* **k-Fold Cross Validation**:
+ 1. Split $S$ into $k$ disjoint subsets ($S_1, \dots, S_k$).
+ 2. For each model $M_i$, train it $k$ times. In each iteration $j$, train on all subsets *except* $S_j$, and test on $S_j$.
+ 3. The estimated generalization error for $M_i$ is the average of the $k$ test errors.
+ 4. Select the model $M_i$ with the lowest estimated error, then retrain it on the entire training set $S$.
+ Typical choice: $k=10$.
+* **Leave-One-Out Cross Validation (LOOCV)**: An extreme case of k-fold where $k=n$ (number of training examples). Train on $n-1$ examples, test on 1, repeat $n$ times.
+
+### 2. Feature Selection
+
+This is a special case of model selection where the goal is to choose a subset of the available features.
+* **Problem**: When the number of features $d$ is very large (potentially $d \gg n$), many features might be irrelevant, leading to overfitting.
+* **Wrapper Feature Selection**: These methods "wrap" around a learning algorithm, using its performance on different feature subsets to guide the search.
+ * **Forward Search**: Starts with an empty set of features, iteratively adds the feature that provides the greatest improvement in cross-validation performance until a stopping criterion (e.g., max features) is met.
+ * **Backward Search**: Starts with all features, iteratively removes the feature that causes the least decrease in performance.
+ * Computationally expensive as they require many calls to the learning algorithm.
+* **Filter Feature Selection**: These methods select features based on their inherent characteristics, independent of the learning algorithm.
+ * Assign a simple score $S(i)$ to each feature $x_i$ indicating its relevance to the target $y$.
+ * Common scores:
+ * Correlation between $x_i$ and $y$.
+ * **Mutual Information (MI)** $MI(x_i, y) = KL(p(x_i,y)||p(x_i)p(y))$. High MI indicates strong dependence between $x_i$ and $y$ (informative feature), while zero MI implies independence (non-informative).
+ * Select the top $k$ features with the highest scores. Cross-validation can then be used to choose the optimal $k$.
+
+### 3. Regularization Techniques
+
+Regularization adds a penalty term to the cost function to discourage overly complex models, thereby reducing variance and preventing overfitting.
+
+#### a. Explicit Regularization (L2 / Ridge Regression)
+
+* **Underdetermined Case**: Often, in modern machine learning, the number of features $d$ can be greater than the number of training examples $n$ ($n < d$). In this **underdetermined** regime, there are infinitely many $\theta$ that perfectly fit the training data.
+* **Regularized Least Squares**: To select a unique solution and control complexity, an L2-norm penalty (Ridge regularization) is added to the least-squares cost function:
+ $\ell(\theta; \lambda) = \frac{1}{2}\|X\theta - y\|^2 + \frac{\lambda}{2}\|\theta\|^2$
+ where $\lambda \ge 0$ is the regularization parameter.
+* **Normal Equations with Regularization**: The solution $\hat{\theta}$ is:
+ $\hat{\theta} = (X^T X + \lambda I)^{-1} X^T y$
+ For $\lambda > 0$, the matrix $(X^T X + \lambda I)$ is always invertible (as its eigenvalues $\sigma_i^2 + \lambda$ are all positive, even if some $\sigma_i^2$ are zero), guaranteeing a unique solution.
+* **Variance Reduction Mechanism**:
+ * The **variance of $\hat{\theta}$ decreases as $\lambda$ increases**.
+ * The eigenvalues of the inverse term $(X^T X + \lambda I)^{-1}$ are $1/(\sigma_i^2 + \lambda)$. As $\lambda$ increases, these eigenvalues decrease, directly impacting the variance.
+ * Specifically, the covariance matrix of $\hat{\theta}$ is $C = \text{Cov}[\hat{\theta}] = ((X^T X + \lambda I)^{-1} X^T) (\tau^2 I) (X (X^T X + \lambda I)^{-1})$. Its eigenvalues are $\tau^2 \sigma_i^2 / (\sigma_i^2 + \lambda)^2$, which are decreasing functions of $\lambda$.
+* **Bias-Variance Tradeoff**: Regularization introduces **bias** by shrinking $\hat{\theta}$ towards zero: $E[\hat{\theta}] = (X^T X + \lambda I)^{-1} (X^T X) \theta^*$. This "shrunk" estimate deviates from the true $\theta^*$. However, this increase in bias is traded for a significant reduction in variance. The overall expected squared error $E[\|\hat{\theta}-\theta^*\|^2]$ (MSE) often decreases with moderate $\lambda$.
+
+#### b. Probabilistic Regularization (Bayesian MAP)
+
+* **Bayesian View**: Instead of viewing parameters $\theta$ as fixed but unknown (frequentist view), the Bayesian approach treats $\theta$ as a random variable with a **prior distribution** $p(\theta)$.
+* **Posterior Distribution**: Given training data $S$, the posterior distribution $p(\theta|S)$ is computed using Bayes' theorem: $p(\theta|S) \propto p(S|\theta)p(\theta)$.
+* **MAP (Maximum a Posteriori) Estimate**: Instead of computing the full posterior, we often find the $\theta$ that maximizes the posterior probability:
+ $\theta_{MAP} = \operatorname{argmax}_\theta \left( \prod_{i=1}^n p(y^{(i)}|x^{(i)}, \theta) \right) p(\theta)$
+ This is equivalent to MLE but includes the prior $p(\theta)$.
+* **Relationship to Regularization**: If a Gaussian prior $p(\theta) \sim \mathcal{N}(0, \tau^2 I)$ is used, the MAP estimate for $\theta$ effectively results in a penalty term proportional to $\|\theta\|^2$ in the log-likelihood optimization, thus acting as L2 regularization. This forces $\theta$ to have a smaller norm, reducing overfitting.
+
+#### c. Implicit Regularization (Gradient Descent Initialization)
+
+* **Underdetermined Least Squares (no explicit penalty $\lambda=0$)**: Even without an L2 penalty, optimization algorithms can implicitly regularize.
+* **Gradient Descent and Null Space**: For a design matrix $X$ with $n < d$, the parameter space $\mathbb{R}^d$ can be decomposed into two orthogonal subspaces: the null space of $X$ ($Null(X)$) and the range space of $X^T$ ($Range(X^T)$).
+ * The gradient of the least squares cost function, $g(\theta) = X^T(X\theta - y)$, lies entirely within $Range(X^T)$ and is orthogonal to $Null(X)$.
+ * Crucially, if gradient descent is initialized at $\theta_0$, the component of $\theta$ in $Null(X)$ (i.e., $P_0(\theta_0)$) remains unchanged throughout the optimization: $P_0(\theta^{(t+1)}) = P_0(\theta^{(t)})$. No learning occurs in the null space.
+* **Initialization at Zero**: If gradient descent is initialized at $\theta_0 = 0$, the solution will have $P_0(\hat{\theta}) = 0$. This means the solution found by gradient descent will be entirely in $Range(X^T)$. This specific solution is the minimum-norm solution (closest to the origin) that fits the data, which is effectively what the Moore-Penrose pseudoinverse solution (for $\lambda=0$) also provides.
+* **Conclusion**: Initializing gradient descent at $\theta_0=0$ acts as a form of regularization in underdetermined settings, by implicitly constraining the solution to a specific subspace and minimizing its norm.
+* **Other Implicit Regularizers**: Modern machine learning techniques like **dropout** and **data augmentation** also regularize models by effectively introducing noise or increasing data diversity, preventing overfitting. Adding more training data also serves as a form of regularization by reducing the model's sensitivity to any specific training example.

@@ -8,3 +8,6 @@ client/node_modules/
 client/dist/
 sample.aiff
 sample_audio.wav
+data/*.db
+data/*.db-shm
+data/*.db-wal

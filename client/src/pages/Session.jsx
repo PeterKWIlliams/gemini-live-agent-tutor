@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import AudioVisualizer from '../components/AudioVisualizer';
 import Transcript from '../components/Transcript';
 import useAudioStream from '../hooks/useAudioStream';
 import useWebSocket from '../hooks/useWebSocket';
 import { decodePCM16ToAudio, getOutputSampleRate } from '../lib/audio';
-import { getWsBaseUrl } from '../lib/api';
+import { getApiBaseUrl, getWsBaseUrl } from '../lib/api';
+
+const PdfViewer = lazy(() => import('../components/PdfViewer'));
 
 export default function Session({ session, mode, persona, onComplete, onAbort }) {
   const [messages, setMessages] = useState([]);
@@ -13,6 +15,8 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
   const [error, setError] = useState('');
   const [sessionRun, setSessionRun] = useState(0);
   const [isMaterialExpanded, setIsMaterialExpanded] = useState(false);
+  const [isPdfViewerExpanded, setIsPdfViewerExpanded] = useState(false);
+  const [selectedPdfName, setSelectedPdfName] = useState('');
 
   const playbackContextRef = useRef(null);
   const nextPlaybackTimeRef = useRef(0);
@@ -110,6 +114,27 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
 
   const materialText = session.material_text || session.material_preview || '';
   const materialPreview = session.material_preview || materialText;
+  const sourceDocuments = useMemo(
+    () =>
+      (session.source_documents || []).map((document) => ({
+        ...document,
+        resolvedViewUrl: document.view_url?.startsWith('http')
+          ? document.view_url
+          : `${getApiBaseUrl()}${document.view_url}`,
+      })),
+    [session.source_documents],
+  );
+  const selectedSourceDocument = useMemo(
+    () =>
+      sourceDocuments.find((document) => document.name === selectedPdfName) ||
+      sourceDocuments[0] ||
+      null,
+    [selectedPdfName, sourceDocuments],
+  );
+
+  useEffect(() => {
+    setSelectedPdfName(sourceDocuments[0]?.name || '');
+  }, [sourceDocuments]);
 
   useEffect(() => {
     connect(`${getWsBaseUrl()}/ws/${session.session_id}`);
@@ -227,6 +252,8 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     setError('');
     setStatus('Connecting...');
     setIsMaterialExpanded(false);
+    setIsPdfViewerExpanded(false);
+    setSelectedPdfName(sourceDocuments[0]?.name || '');
     setSessionRun((current) => current + 1);
   };
 
@@ -322,6 +349,65 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
               </p>
             </div>
           </div>
+
+          {sourceDocuments.length ? (
+            <div className="rounded-[2.5rem] border border-white/60 bg-white/75 p-6 shadow-glow">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.3em] text-moss/70">Original PDFs</p>
+                  <p className="mt-2 text-sm leading-6 text-ink/60">
+                    Judges can expand this to inspect the original preset documents directly in the booth.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsPdfViewerExpanded((current) => !current)}
+                  className="rounded-full border border-ink/10 bg-sand px-4 py-2 text-sm font-semibold text-ink transition hover:border-orange hover:text-orange"
+                >
+                  {isPdfViewerExpanded ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+
+              {isPdfViewerExpanded ? (
+                <div className="mt-4 space-y-4">
+                  {sourceDocuments.length > 1 ? (
+                    <label className="block space-y-2">
+                      <span className="text-xs font-semibold uppercase tracking-[0.22em] text-moss/70">
+                        Choose document
+                      </span>
+                      <select
+                        value={selectedSourceDocument?.name || ''}
+                        onChange={(event) => setSelectedPdfName(event.target.value)}
+                        className="w-full rounded-[1rem] border border-ink/10 bg-white px-4 py-3 text-sm font-medium text-ink outline-none transition focus:border-orange"
+                      >
+                        {sourceDocuments.map((document) => (
+                          <option key={document.name} value={document.name}>
+                            {document.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+
+                  {selectedSourceDocument ? (
+                    <Suspense
+                      fallback={
+                        <div className="rounded-[1.5rem] border border-ink/10 bg-paper px-4 py-6 text-sm font-semibold text-ink/60">
+                          Loading viewer…
+                        </div>
+                      }
+                    >
+                      <PdfViewer
+                        key={selectedSourceDocument.name}
+                        url={selectedSourceDocument.resolvedViewUrl}
+                        label={selectedSourceDocument.label}
+                      />
+                    </Suspense>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {scores ? (
             <div className="rounded-[2.5rem] border border-white/60 bg-white/75 p-6 shadow-glow">

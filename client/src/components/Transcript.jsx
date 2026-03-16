@@ -1,10 +1,18 @@
 import { useEffect, useRef } from 'react';
 
 export default function Transcript({ messages }) {
+  const containerRef = useRef(null);
   const endRef = useRef(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: 'smooth',
+    });
   }, [messages]);
 
   return (
@@ -19,7 +27,7 @@ export default function Transcript({ messages }) {
         </span>
       </div>
 
-      <div className="mt-6 flex max-h-[52vh] flex-col gap-3 overflow-y-auto pr-1">
+      <div ref={containerRef} className="mt-6 flex max-h-[52vh] flex-col gap-3 overflow-y-auto pr-1">
         {messages.length === 0 ? (
           <div className="rounded-[1.5rem] border border-dashed border-ink/10 bg-sand/70 p-5 text-sm leading-6 text-ink/65">
             Once the session starts, TeachBack will stream both your words and the AI's responses here.

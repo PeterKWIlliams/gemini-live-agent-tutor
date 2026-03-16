@@ -15,7 +15,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --platform managed \
   --region "$REGION" \
   --allow-unauthenticated \
-  --set-env-vars "GOOGLE_API_KEY=${GOOGLE_API_KEY:-}" \
+  --set-env-vars "GOOGLE_API_KEY=${GOOGLE_API_KEY:-},PRESET_TRAILS_GCS_BUCKET=${PRESET_TRAILS_GCS_BUCKET:-},PRESET_TRAILS_GCS_PREFIX=${PRESET_TRAILS_GCS_PREFIX:-},PRESET_TRAILS_AUTO_SYNC=${PRESET_TRAILS_AUTO_SYNC:-false}" \
   --memory 1Gi \
   --cpu 2 \
   --timeout 900 \

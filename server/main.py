@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import inspect
 import json
 import logging
 import os
 import uuid
+import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,10 +27,7 @@ from pydantic import BaseModel, Field
 
 from server.gemini_session import (
     create_live_session,
-    extract_audio_messages,
-    extract_tool_calls,
-    extract_transcripts,
-    response_to_dict,
+    extract_from_response,
     send_audio_chunk,
     send_text_instruction,
     send_tool_response,
@@ -87,6 +86,8 @@ class RuntimeState:
     scores: dict[str, Any] | None = None
     last_user_text: str = ""
     last_agent_text: str = ""
+    partial_user_text: str = ""
+    partial_agent_text: str = ""
     close_task: asyncio.Task | None = None
 
 
@@ -128,6 +129,11 @@ def build_client():
 def preview_text(material: str) -> str:
     compact = material.replace("\n", " ").strip()
     return compact[:200] + ("..." if len(compact) > 200 else "")
+
+
+def get_sample_material_text() -> str:
+    raw_text = os.getenv("SAMPLE_MATERIAL_TEXT", "")
+    return raw_text.replace("\\n", "\n").strip()
 
 
 def build_transcript_text(messages: list[dict[str, str]]) -> str:
@@ -225,24 +231,40 @@ async def append_transcript(
     state: RuntimeState,
     speaker: str,
     text: str,
+    finished: bool = True,
 ):
     text = text.strip()
     if not text:
         return
 
     if speaker == "user":
-        if text == state.last_user_text:
+        combined_text = f"{state.partial_user_text} {text}".strip() if state.partial_user_text and not finished else text
+        if combined_text == state.last_user_text and finished:
             return
-        state.last_user_text = text
+        if finished:
+            if state.partial_user_text:
+                combined_text = f"{state.partial_user_text} {text}".strip()
+            state.last_user_text = combined_text
+            state.partial_user_text = ""
+        else:
+            state.partial_user_text = combined_text
         message_type = "transcript_user"
     else:
-        if text == state.last_agent_text:
+        combined_text = f"{state.partial_agent_text} {text}".strip() if state.partial_agent_text and not finished else text
+        if combined_text == state.last_agent_text and finished:
             return
-        state.last_agent_text = text
+        if finished:
+            if state.partial_agent_text:
+                combined_text = f"{state.partial_agent_text} {text}".strip()
+            state.last_agent_text = combined_text
+            state.partial_agent_text = ""
+        else:
+            state.partial_agent_text = combined_text
         message_type = "transcript_agent"
 
-    state.transcript.append({"speaker": speaker, "text": text})
-    await websocket.send_json({"type": message_type, "text": text})
+    if finished:
+        state.transcript.append({"speaker": speaker, "text": combined_text})
+    await websocket.send_json({"type": message_type, "text": combined_text, "finished": finished})
 
 
 async def handle_tool_call(
@@ -280,26 +302,75 @@ async def stream_live_events(
     state: RuntimeState,
 ):
     """Forward Gemini Live output to the frontend as it arrives."""
-    async for response in live_session.receive():
-        payload = response_to_dict(response)
+    LOGGER.info("Receive loop entered for session %s", state.session_id)
+    response_count = 0
+    turn_number = 0
 
-        user_texts, agent_texts = extract_transcripts(payload)
-        for text in user_texts:
-            await append_transcript(websocket, state, "user", text)
-        for text in agent_texts:
-            await append_transcript(websocket, state, "agent", text)
+    # session.receive() yields a finite async generator that exhausts after
+    # each turn_complete.  Re-enter it for subsequent turns.
+    while not state.session_closed.is_set():
+        async for response in live_session.receive():
+            response_count += 1
+            # Read SDK response fields directly (no model_dump / dict-scraping)
+            result = extract_from_response(response)
 
-        audio_messages = extract_audio_messages(payload)
-        for audio_message in audio_messages:
-            await websocket.send_json({"type": "audio", "data": audio_message})
+            user_texts = result["user_transcripts"]
+            agent_texts = result["agent_transcripts"]
+            audio_messages = result["audio_chunks"]
+            tool_calls = result["tool_calls"]
 
-        tool_calls = extract_tool_calls(payload)
-        for tool_call in tool_calls:
-            await handle_tool_call(websocket, live_session, state, tool_call)
+            if user_texts or agent_texts:
+                LOGGER.info(
+                    "Live transcription event (turn %d, msg #%d) user=%s agent=%s",
+                    turn_number,
+                    response_count,
+                    user_texts,
+                    agent_texts,
+                )
+            for item in user_texts:
+                await append_transcript(
+                    websocket,
+                    state,
+                    "user",
+                    item["text"],
+                    finished=item.get("finished", True),
+                )
+            for item in agent_texts:
+                await append_transcript(
+                    websocket,
+                    state,
+                    "agent",
+                    item["text"],
+                    finished=item.get("finished", True),
+                )
 
-        if state.tool_called.is_set() and not state.session_closed.is_set():
-            if agent_texts or audio_messages or tool_calls:
-                schedule_close_after_quiet_period(websocket, state)
+            for audio_message in audio_messages:
+                await websocket.send_json({"type": "audio", "data": audio_message})
+
+            for tool_call in tool_calls:
+                await handle_tool_call(websocket, live_session, state, tool_call)
+
+            if result["turn_complete"]:
+                turn_number += 1
+                LOGGER.info(
+                    "Turn complete for session %s (turn %d, %d responses so far)",
+                    state.session_id,
+                    turn_number,
+                    response_count,
+                )
+
+            if result["interrupted"]:
+                LOGGER.info("Interrupted flag for session %s (turn %d)", state.session_id, turn_number)
+
+            if state.tool_called.is_set() and not state.session_closed.is_set():
+                if agent_texts or audio_messages or tool_calls:
+                    schedule_close_after_quiet_period(websocket, state)
+
+        LOGGER.info(
+            "Receive generator exhausted for session %s after turn %d — re-entering for next turn",
+            state.session_id,
+            turn_number,
+        )
 
 
 async def end_session_with_safety_net(
@@ -403,6 +474,14 @@ async def get_modes():
     return list_modes()
 
 
+@app.get("/api/sample-material")
+async def get_sample_material():
+    sample_text = get_sample_material_text()
+    if not sample_text:
+        raise HTTPException(status_code=404, detail="Sample material is not configured.")
+    return {"text": sample_text}
+
+
 @app.get("/health")
 async def health():
     return {
@@ -414,6 +493,7 @@ async def health():
 @app.websocket("/ws/{session_id}")
 async def websocket_session(websocket: WebSocket, session_id: str):
     await websocket.accept()
+    LOGGER.info("WebSocket accepted for session %s", session_id)
 
     record = await app.state.store.get(session_id)
     if record is None:
@@ -425,7 +505,9 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     state: RuntimeState | None = None
 
     try:
+        LOGGER.info("Waiting for start message for session %s", session_id)
         start_message = await websocket.receive_json()
+        LOGGER.info("Received start payload for session %s: %s", session_id, start_message)
         if start_message.get("type") != "start":
             await websocket.send_json({"type": "error", "message": "Expected a start message."})
             return
@@ -443,19 +525,47 @@ async def websocket_session(websocket: WebSocket, session_id: str):
             material=record.material,
         )
 
+        LOGGER.info(
+            "Opening Gemini Live session for session %s with mode=%s persona=%s",
+            session_id,
+            mode_id,
+            persona_id,
+        )
         async with create_live_session(app.state.client, mode_id, persona_id, record.material) as live_session:
-            await websocket.send_json({"type": "ready"})
+            LOGGER.info("Gemini Live session connected for session %s", session_id)
 
-            kickoff = (
-                f"You are starting a {MODES[mode_id]['name']} session as {PERSONAS[persona_id]['name']}. "
-                "Greet the user warmly, explain the vibe of the session in one short sentence, and begin."
-            )
-            await send_text_instruction(live_session, kickoff)
+            # One-time: log the SDK method signature so we can verify param names
+            try:
+                sig = inspect.signature(live_session.send_realtime_input)
+                LOGGER.info("send_realtime_input params: %s", list(sig.parameters.keys()))
+            except Exception:
+                pass
+
             receive_task = asyncio.create_task(stream_live_events(websocket, live_session, state))
+            LOGGER.info("Started receive task for session %s", session_id)
+
+            def _log_receive_task_failure(task: asyncio.Task):
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc:
+                    LOGGER.exception("Receive task failed for session %s", session_id, exc_info=exc)
+
+            receive_task.add_done_callback(_log_receive_task_failure)
+
+            await websocket.send_json({"type": "ready"})
+            LOGGER.info("Sent ready message to client for session %s", session_id)
+
+            # Debug: accumulate audio to save as WAV for inspection
+            audio_debug_buffer = bytearray()
+            audio_chunk_count = 0
+            audio_sample_rate = 0  # detected from first chunk
+            audio_turn_number = 0  # incremented on each audio_stream_end
 
             while True:
                 message = await websocket.receive_json()
                 message_type = message.get("type")
+                LOGGER.info("Received websocket message for session %s: %s", session_id, message_type)
 
                 if message_type == "audio":
                     try:
@@ -463,7 +573,46 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     except Exception:
                         await websocket.send_json({"type": "error", "message": "Invalid audio payload."})
                         continue
-                    await send_audio_chunk(live_session, pcm_bytes)
+                    # Detect sample rate: prefer client-supplied field,
+                    # fall back to inferring from chunk size (4096-sample
+                    # ScriptProcessor buffer → 8192 bytes at native rate).
+                    client_rate = message.get("sampleRate")
+                    if client_rate:
+                        audio_sample_rate = int(client_rate)
+                    elif audio_sample_rate == 0:
+                        # 8192 bytes = 4096 samples → 48 kHz native
+                        # 2730 bytes = 1365 samples → old 16 kHz resample
+                        audio_sample_rate = 48000 if len(pcm_bytes) >= 8000 else 16000
+                    audio_chunk_count += 1
+                    audio_debug_buffer.extend(pcm_bytes)
+                    if audio_chunk_count == 1:
+                        LOGGER.info(
+                            "Turn %d first audio chunk: %d bytes, rate=%d (from_client=%s)",
+                            audio_turn_number, len(pcm_bytes), audio_sample_rate, client_rate,
+                        )
+                    await send_audio_chunk(live_session, pcm_bytes, audio_sample_rate)
+
+                elif message_type == "audio_stream_end":
+                    LOGGER.info(
+                        "Forwarding audio_stream_end for session %s turn %d (%d chunks, %d bytes total)",
+                        session_id, audio_turn_number, audio_chunk_count, len(audio_debug_buffer),
+                    )
+                    await live_session.send_realtime_input(audio_stream_end=True)
+                    audio_turn_number += 1
+                    # Save first utterance as WAV for diagnosis
+                    if audio_debug_buffer:
+                        wav_path = f"/tmp/teachback_debug_{session_id[:8]}.wav"
+                        try:
+                            with wave.open(wav_path, "wb") as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(audio_sample_rate or 48000)
+                                wf.writeframes(bytes(audio_debug_buffer))
+                            LOGGER.info("Saved debug audio to %s (rate=%d)", wav_path, audio_sample_rate)
+                        except Exception as wav_exc:
+                            LOGGER.warning("Failed to save debug WAV: %s", wav_exc)
+                    audio_debug_buffer = bytearray()
+                    audio_chunk_count = 0
 
                 elif message_type == "stop":
                     await live_session.send_realtime_input(audio_stream_end=True)
@@ -481,11 +630,12 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     finally:
         if receive_task:
             receive_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await receive_task
         if state and state.close_task:
             state.close_task.cancel()
-        await app.state.store.delete(session_id)
+        if state and state.session_closed.is_set():
+            await app.state.store.delete(session_id)
 
 
 if STATIC_DIR.exists():

@@ -11,19 +11,45 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
   const [status, setStatus] = useState('Connecting...');
   const [scores, setScores] = useState(null);
   const [error, setError] = useState('');
+  const [sessionRun, setSessionRun] = useState(0);
 
   const playbackContextRef = useRef(null);
   const nextPlaybackTimeRef = useRef(0);
   const speakingTimeoutRef = useRef(null);
+  const isAgentSpeakingRef = useRef(false);
   const hasStartedRef = useRef(false);
+  const hasMicStartedRef = useRef(false);
   const scoresRef = useRef(null);
 
   const { isRecording, startRecording, stopRecording, audioLevel, error: audioError } = useAudioStream();
 
+  useEffect(() => {
+    hasMicStartedRef.current = isRecording;
+  }, [isRecording]);
+
+  const beginRecording = async () => {
+    if (hasMicStartedRef.current || readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    hasMicStartedRef.current = true;
+    setStatus('Listening...');
+    await startRecording(
+      (chunk, sampleRate) => send({ type: 'audio', data: chunk, sampleRate }),
+      {
+        onSpeechStart: () => setStatus('Listening...'),
+        onSpeechEnd: () => {
+          setStatus('Ready for next thought');
+          send({ type: 'audio_stream_end' });
+        },
+        allowSend: () => !isAgentSpeakingRef.current,
+      },
+    );
+  };
+
   const handleIncomingMessage = async (message) => {
     if (message.type === 'ready') {
-      setStatus('Listening...');
-      await startRecording((chunk) => send({ type: 'audio', data: chunk }));
+      setStatus('Ready to start');
       return;
     }
 
@@ -33,12 +59,12 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     }
 
     if (message.type === 'transcript_user') {
-      pushTranscript('user', message.text);
+      pushTranscript('user', message.text, message.finished !== false);
       return;
     }
 
     if (message.type === 'transcript_agent') {
-      pushTranscript('agent', message.text);
+      pushTranscript('agent', message.text, message.finished !== false);
       return;
     }
 
@@ -57,6 +83,8 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
 
     if (message.type === 'error') {
       setError(message.message || 'The live session disconnected unexpectedly.');
+      setStatus('Needs attention');
+      disconnect();
     }
   };
 
@@ -89,7 +117,7 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
       disconnect();
       playbackContextRef.current?.close();
     };
-  }, [connect, disconnect, session.session_id, stopRecording]);
+  }, [connect, disconnect, session.session_id, sessionRun, stopRecording]);
 
   useEffect(() => {
     if (readyState !== WebSocket.OPEN || hasStartedRef.current) {
@@ -111,15 +139,25 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     }
   }, [audioError]);
 
-  const pushTranscript = (speaker, text) => {
+  const pushTranscript = (speaker, text, finished = true) => {
     setMessages((current) => {
       if (!text) {
         return current;
       }
 
       const last = current[current.length - 1];
-      if (last && last.speaker === speaker && last.text === text) {
+      if (last && last.speaker === speaker && last.text === text && last.finished === finished) {
         return current;
+      }
+
+      if (last && last.speaker === speaker && last.finished === false) {
+        const next = [...current];
+        next[next.length - 1] = {
+          ...last,
+          text,
+          finished,
+        };
+        return next;
       }
 
       return [
@@ -128,6 +166,7 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
           id: `${speaker}-${current.length}-${Date.now()}`,
           speaker,
           text,
+          finished,
         },
       ];
     });
@@ -155,10 +194,12 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     source.start(startAt);
     nextPlaybackTimeRef.current = startAt + buffer.duration;
 
+    isAgentSpeakingRef.current = true;
     setStatus('Speaking...');
     window.clearTimeout(speakingTimeoutRef.current);
     speakingTimeoutRef.current = window.setTimeout(() => {
-      setStatus(isRecording ? 'Listening...' : 'Ready');
+      isAgentSpeakingRef.current = false;
+      setStatus(hasMicStartedRef.current ? 'Listening...' : 'Ready to start');
     }, 450);
   };
 
@@ -166,6 +207,23 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     await stopRecording();
     setStatus('Wrapping up...');
     send({ type: 'stop' });
+  };
+
+  const restartSession = async () => {
+    await stopRecording();
+    disconnect();
+    playbackContextRef.current?.close();
+    playbackContextRef.current = null;
+    nextPlaybackTimeRef.current = 0;
+    isAgentSpeakingRef.current = false;
+    hasStartedRef.current = false;
+    hasMicStartedRef.current = false;
+    scoresRef.current = null;
+    setMessages([]);
+    setScores(null);
+    setError('');
+    setStatus('Connecting...');
+    setSessionRun((current) => current + 1);
   };
 
   return (
@@ -192,10 +250,25 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
               <AudioVisualizer audioLevel={audioLevel} isRecording={isRecording} status={connectionLabel} />
               <button
                 type="button"
+                onClick={beginRecording}
+                disabled={readyState !== WebSocket.OPEN || isRecording}
+                className="rounded-full bg-orange px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#e3763b] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isRecording ? 'Listening now' : 'Start talking'}
+              </button>
+              <button
+                type="button"
                 onClick={endSession}
                 className="rounded-full bg-ink px-5 py-3 text-sm font-semibold text-sand transition hover:bg-moss"
               >
                 End session
+              </button>
+              <button
+                type="button"
+                onClick={restartSession}
+                className="rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-ink/30"
+              >
+                Restart
               </button>
               <button
                 type="button"
@@ -217,9 +290,9 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
             <p className="text-xs uppercase tracking-[0.3em] text-sand/60">Session notes</p>
             <h2 className="mt-3 font-display text-4xl">How to get the most out of this run</h2>
             <ul className="mt-5 space-y-3 text-sm leading-6 text-sand/75">
-              <li>Explain your thinking step by step instead of rushing to the answer.</li>
-              <li>If the persona pushes back, use that moment to clarify rather than defend.</li>
-              <li>You can stop anytime with the button or by saying you are done out loud.</li>
+              <li>Click `Start talking` when you are ready to begin this run.</li>
+              <li>Use `Restart` to wipe this attempt and reopen a fresh live session with the same setup.</li>
+              <li>Use `End session` only when you want scoring and a wrap-up.</li>
             </ul>
           </div>
 

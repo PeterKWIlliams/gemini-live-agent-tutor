@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 const CLOSED = 3;
 
 export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {}) {
+  const onMessageRef = useRef(onMessage);
   const socketRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
   const disconnectIntentRef = useRef(false);
@@ -10,6 +11,10 @@ export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {
 
   const [lastMessage, setLastMessage] = useState(null);
   const [readyState, setReadyState] = useState(CLOSED);
+
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimeoutRef.current) {
@@ -47,7 +52,7 @@ export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {
         try {
           const parsed = JSON.parse(event.data);
           setLastMessage(parsed);
-          onMessage?.(parsed);
+          onMessageRef.current?.(parsed);
         } catch (error) {
           console.error('Failed to parse websocket message.', error);
         }
@@ -58,6 +63,10 @@ export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {
       };
 
       socket.onclose = () => {
+        if (socketRef.current !== socket) {
+          return;
+        }
+
         setReadyState(socket.readyState);
 
         if (disconnectIntentRef.current || reconnectAttemptsRef.current >= maxReconnectAttempts) {
@@ -68,7 +77,7 @@ export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {
         reconnectTimeoutRef.current = window.setTimeout(() => connect(url), 750);
       };
     },
-    [clearReconnectTimer, maxReconnectAttempts, onMessage],
+    [clearReconnectTimer, maxReconnectAttempts],
   );
 
   const send = useCallback((payload) => {

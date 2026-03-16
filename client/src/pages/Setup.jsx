@@ -28,6 +28,28 @@ export default function Setup({
   const [topic, setTopic] = useState('');
   const [topicDescription, setTopicDescription] = useState('');
   const [error, setError] = useState('');
+  const [sampleLoading, setSampleLoading] = useState(false);
+
+  const loadSampleMaterial = async () => {
+    try {
+      setSampleLoading(true);
+      setError('');
+
+      const response = await fetch(`${getApiBaseUrl()}/api/sample-material`);
+      if (!response.ok) {
+        throw new Error((await response.json()).detail || 'Sample material is not configured.');
+      }
+
+      const data = await response.json();
+      setMaterialTab('text');
+      setSelectedFile(null);
+      setTextMaterial(data.text || '');
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      setSampleLoading(false);
+    }
+  };
 
   const materialMutation = useMutation({
     mutationFn: async () => {
@@ -149,6 +171,17 @@ export default function Setup({
             </div>
 
             <div className="mt-6">
+              <div className="mb-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={loadSampleMaterial}
+                  disabled={sampleLoading || materialMutation.isPending}
+                  className="rounded-full border border-ink/10 bg-sand px-4 py-2 text-sm font-semibold text-ink transition hover:border-orange hover:text-orange disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {sampleLoading ? 'Loading sample...' : 'Use sample material'}
+                </button>
+              </div>
+
               {materialTab === 'upload' ? (
                 <FileUpload disabled={materialMutation.isPending} onSelect={setSelectedFile} />
               ) : null}

@@ -57,11 +57,21 @@ def create_live_session(client, mode_id: str, persona_id: str, material: str):
     return client.aio.live.connect(model=MODEL, config=config)
 
 
-async def send_audio_chunk(session, pcm_bytes: bytes):
-    """Forward 16 kHz PCM audio to Gemini Live."""
-    await session.send_realtime_input(
-        audio=types.Blob(data=pcm_bytes, mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}")
-    )
+async def send_audio_chunk(session, pcm_bytes: bytes, sample_rate: int = SEND_SAMPLE_RATE):
+    """Forward PCM audio to Gemini Live at the given sample rate.
+
+    Uses ``media=`` which serialises as ``mediaChunks`` on the wire –
+    the format the Live API actually processes for realtime audio.
+
+    Re-chunks to SUB_CHUNK_SIZE to match the standalone test's proven
+    working chunk size (3200 bytes ~ 33ms at 48 kHz).
+    """
+    SUB_CHUNK_SIZE = 3200
+    mime = f"audio/pcm;rate={sample_rate}"
+    for i in range(0, len(pcm_bytes), SUB_CHUNK_SIZE):
+        await session.send_realtime_input(
+            media=types.Blob(data=pcm_bytes[i : i + SUB_CHUNK_SIZE], mime_type=mime)
+        )
 
 
 async def send_text_instruction(session, text: str, turn_complete: bool = True):
@@ -132,8 +142,8 @@ def extract_audio_messages(payload: dict[str, Any]) -> list[str]:
     return messages
 
 
-def extract_transcripts(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Return lists of user and agent transcript text snippets."""
+def extract_transcripts(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return user and agent transcription events with completion state."""
     user_candidates = [
         _nested_get(payload, "server_content", "input_transcription"),
         _nested_get(payload, "serverContent", "inputTranscription"),
@@ -143,14 +153,19 @@ def extract_transcripts(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
         _nested_get(payload, "serverContent", "outputTranscription"),
     ]
 
-    def collect(candidates: list[Any]) -> list[str]:
-        items: list[str] = []
+    def collect(candidates: list[Any]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
         for candidate in candidates:
             if not candidate:
                 continue
             text = candidate.get("text") if isinstance(candidate, dict) else None
             if text:
-                items.append(text.strip())
+                items.append(
+                    {
+                        "text": text.strip(),
+                        "finished": bool(candidate.get("finished")),
+                    }
+                )
         return items
 
     return collect(user_candidates), collect(agent_candidates)
@@ -181,3 +196,78 @@ def extract_tool_calls(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
     return results
+
+
+def extract_from_response(response: Any) -> dict[str, Any]:
+    """Read structured fields directly from the SDK response object.
+
+    Uses getattr to access SDK properties without going through
+    model_dump / dict serialization, which can silently drop fields
+    like input_transcription.
+    """
+    result: dict[str, Any] = {
+        "audio_chunks": [],
+        "user_transcripts": [],
+        "agent_transcripts": [],
+        "tool_calls": [],
+        "turn_complete": False,
+        "interrupted": False,
+    }
+
+    sc = getattr(response, "server_content", None)
+    if sc is not None:
+        result["turn_complete"] = bool(getattr(sc, "turn_complete", False))
+        result["interrupted"] = bool(getattr(sc, "interrupted", False))
+
+        # Input transcription (user speech -> text)
+        it = getattr(sc, "input_transcription", None)
+        if it is not None:
+            text = getattr(it, "text", None) or ""
+            if text.strip():
+                result["user_transcripts"].append({
+                    "text": text.strip(),
+                    "finished": bool(getattr(it, "finished", True)),
+                })
+
+        # Output transcription (agent speech -> text)
+        ot = getattr(sc, "output_transcription", None)
+        if ot is not None:
+            text = getattr(ot, "text", None) or ""
+            if text.strip():
+                result["agent_transcripts"].append({
+                    "text": text.strip(),
+                    "finished": bool(getattr(ot, "finished", True)),
+                })
+
+        # Audio from model turn
+        mt = getattr(sc, "model_turn", None)
+        if mt is not None:
+            for part in getattr(mt, "parts", None) or []:
+                inline = getattr(part, "inline_data", None)
+                if inline is None:
+                    continue
+                data = getattr(inline, "data", None)
+                if isinstance(data, bytes):
+                    result["audio_chunks"].append(
+                        base64.b64encode(data).decode("ascii")
+                    )
+                elif isinstance(data, str):
+                    result["audio_chunks"].append(data)
+
+    # Tool calls
+    tc = getattr(response, "tool_call", None)
+    if tc is not None:
+        for call in getattr(tc, "function_calls", None) or []:
+            args = getattr(call, "args", None)
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            result["tool_calls"].append({
+                "id": getattr(call, "id", None),
+                "name": getattr(call, "name", None),
+                "args": args or {},
+            })
+
+    return result

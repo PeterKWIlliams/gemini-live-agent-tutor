@@ -12,6 +12,7 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
   const [scores, setScores] = useState(null);
   const [error, setError] = useState('');
   const [sessionRun, setSessionRun] = useState(0);
+  const [isMaterialExpanded, setIsMaterialExpanded] = useState(false);
 
   const playbackContextRef = useRef(null);
   const nextPlaybackTimeRef = useRef(0);
@@ -40,7 +41,6 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
         onSpeechStart: () => setStatus('Listening...'),
         onSpeechEnd: () => {
           setStatus('Ready for next thought');
-          send({ type: 'audio_stream_end' });
         },
         allowSend: () => !isAgentSpeakingRef.current,
       },
@@ -107,6 +107,9 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     }
     return 'Connecting...';
   }, [audioError, error, isRecording, readyState, status]);
+
+  const materialText = session.material_text || session.material_preview || '';
+  const materialPreview = session.material_preview || materialText;
 
   useEffect(() => {
     connect(`${getWsBaseUrl()}/ws/${session.session_id}`);
@@ -223,6 +226,7 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
     setScores(null);
     setError('');
     setStatus('Connecting...');
+    setIsMaterialExpanded(false);
     setSessionRun((current) => current + 1);
   };
 
@@ -297,8 +301,26 @@ export default function Session({ session, mode, persona, onComplete, onAbort })
           </div>
 
           <div className="rounded-[2.5rem] border border-white/60 bg-white/75 p-6 shadow-glow">
-            <p className="text-xs uppercase tracking-[0.3em] text-moss/70">Prepared material</p>
-            <p className="mt-3 text-sm leading-6 text-ink/70">{session.material_preview}</p>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-xs uppercase tracking-[0.3em] text-moss/70">Prepared material</p>
+                <p className="mt-2 text-sm leading-6 text-ink/60">
+                  Judges can expand this to read the exact source text the session is grounded on.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsMaterialExpanded((current) => !current)}
+                className="rounded-full border border-ink/10 bg-sand px-4 py-2 text-sm font-semibold text-ink transition hover:border-orange hover:text-orange"
+              >
+                {isMaterialExpanded ? 'Collapse' : 'Expand'}
+              </button>
+            </div>
+            <div className="mt-4 rounded-[1.5rem] bg-paper p-4">
+              <p className="text-sm leading-6 text-ink/70 whitespace-pre-wrap">
+                {isMaterialExpanded ? materialText : materialPreview}
+              </p>
+            </div>
           </div>
 
           {scores ? (

@@ -136,6 +136,52 @@ def get_sample_material_text() -> str:
     return raw_text.replace("\\n", "\n").strip()
 
 
+def get_sample_material_options() -> list[dict[str, str]]:
+    raw_options = os.getenv("SAMPLE_MATERIAL_OPTIONS", "").strip()
+    options: list[dict[str, str]] = []
+
+    if raw_options:
+        try:
+            parsed = json.loads(raw_options)
+        except json.JSONDecodeError:
+            LOGGER.warning("SAMPLE_MATERIAL_OPTIONS is not valid JSON.")
+        else:
+            if isinstance(parsed, list):
+                for index, item in enumerate(parsed):
+                    if not isinstance(item, dict):
+                        continue
+                    option_id = str(item.get("id", "")).strip() or f"sample_{index + 1}"
+                    label = str(item.get("label", "")).strip() or f"Sample {index + 1}"
+                    text = str(item.get("text", "")).replace("\\n", "\n").strip()
+                    if text:
+                        options.append(
+                            {
+                                "id": option_id,
+                                "label": label,
+                                "text": text,
+                                "preview": preview_text(text),
+                            }
+                        )
+            else:
+                LOGGER.warning("SAMPLE_MATERIAL_OPTIONS must be a JSON array.")
+
+    if options:
+        return options
+
+    sample_text = get_sample_material_text()
+    if not sample_text:
+        return []
+
+    return [
+        {
+            "id": "sample_material",
+            "label": "Sample material",
+            "text": sample_text,
+            "preview": preview_text(sample_text),
+        }
+    ]
+
+
 def build_transcript_text(messages: list[dict[str, str]]) -> str:
     return "\n".join(f"{item['speaker']}: {item['text']}" for item in messages if item["text"].strip())
 
@@ -233,38 +279,43 @@ async def append_transcript(
     text: str,
     finished: bool = True,
 ):
-    text = text.strip()
-    if not text:
+    if not text or not text.strip():
         return
 
     if speaker == "user":
-        combined_text = f"{state.partial_user_text} {text}".strip() if state.partial_user_text and not finished else text
+        combined_raw = f"{state.partial_user_text}{text}" if state.partial_user_text else text
+        combined_text = combined_raw.strip()
         if combined_text == state.last_user_text and finished:
             return
         if finished:
-            if state.partial_user_text:
-                combined_text = f"{state.partial_user_text} {text}".strip()
             state.last_user_text = combined_text
             state.partial_user_text = ""
         else:
-            state.partial_user_text = combined_text
+            state.partial_user_text = combined_raw
         message_type = "transcript_user"
     else:
-        combined_text = f"{state.partial_agent_text} {text}".strip() if state.partial_agent_text and not finished else text
+        combined_raw = f"{state.partial_agent_text}{text}" if state.partial_agent_text else text
+        combined_text = combined_raw.strip()
         if combined_text == state.last_agent_text and finished:
             return
         if finished:
-            if state.partial_agent_text:
-                combined_text = f"{state.partial_agent_text} {text}".strip()
             state.last_agent_text = combined_text
             state.partial_agent_text = ""
         else:
-            state.partial_agent_text = combined_text
+            state.partial_agent_text = combined_raw
         message_type = "transcript_agent"
 
     if finished:
         state.transcript.append({"speaker": speaker, "text": combined_text})
     await websocket.send_json({"type": message_type, "text": combined_text, "finished": finished})
+
+
+async def flush_partial_transcripts(websocket: WebSocket, state: RuntimeState):
+    """Finalize any in-progress transcript bubble when Gemini marks a turn complete."""
+    if state.partial_user_text:
+        await append_transcript(websocket, state, "user", state.partial_user_text, finished=True)
+    if state.partial_agent_text:
+        await append_transcript(websocket, state, "agent", state.partial_agent_text, finished=True)
 
 
 async def handle_tool_call(
@@ -351,6 +402,7 @@ async def stream_live_events(
                 await handle_tool_call(websocket, live_session, state, tool_call)
 
             if result["turn_complete"]:
+                await flush_partial_transcripts(websocket, state)
                 turn_number += 1
                 LOGGER.info(
                     "Turn complete for session %s (turn %d, %d responses so far)",
@@ -448,7 +500,11 @@ async def upload_material(
     record = SessionRecord(session_id=session_id, material=material, material_preview=preview_text(material))
     await app.state.store.set(record)
 
-    return {"session_id": session_id, "material_preview": record.material_preview}
+    return {
+        "session_id": session_id,
+        "material_preview": record.material_preview,
+        "material_text": record.material,
+    }
 
 
 @app.post("/api/topic")
@@ -461,7 +517,11 @@ async def topic_material(payload: TopicPayload):
     session_id = str(uuid.uuid4())
     record = SessionRecord(session_id=session_id, material=material, material_preview=preview_text(material))
     await app.state.store.set(record)
-    return {"session_id": session_id, "material_preview": record.material_preview}
+    return {
+        "session_id": session_id,
+        "material_preview": record.material_preview,
+        "material_text": record.material,
+    }
 
 
 @app.get("/api/personas")
@@ -476,10 +536,10 @@ async def get_modes():
 
 @app.get("/api/sample-material")
 async def get_sample_material():
-    sample_text = get_sample_material_text()
-    if not sample_text:
+    sample_options = get_sample_material_options()
+    if not sample_options:
         raise HTTPException(status_code=404, detail="Sample material is not configured.")
-    return {"text": sample_text}
+    return {"options": sample_options}
 
 
 @app.get("/health")
@@ -594,10 +654,9 @@ async def websocket_session(websocket: WebSocket, session_id: str):
 
                 elif message_type == "audio_stream_end":
                     LOGGER.info(
-                        "Forwarding audio_stream_end for session %s turn %d (%d chunks, %d bytes total)",
+                        "Ignoring intermediate audio_stream_end for session %s turn %d (%d chunks, %d bytes total)",
                         session_id, audio_turn_number, audio_chunk_count, len(audio_debug_buffer),
                     )
-                    await live_session.send_realtime_input(audio_stream_end=True)
                     audio_turn_number += 1
                     # Save first utterance as WAV for diagnosis
                     if audio_debug_buffer:

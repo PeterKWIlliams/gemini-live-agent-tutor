@@ -225,7 +225,7 @@ def extract_from_response(response: Any) -> dict[str, Any]:
             text = getattr(it, "text", None) or ""
             if text.strip():
                 result["user_transcripts"].append({
-                    "text": text.strip(),
+                    "text": text,
                     "finished": bool(getattr(it, "finished", True)),
                 })
 
@@ -235,7 +235,7 @@ def extract_from_response(response: Any) -> dict[str, Any]:
             text = getattr(ot, "text", None) or ""
             if text.strip():
                 result["agent_transcripts"].append({
-                    "text": text.strip(),
+                    "text": text,
                     "finished": bool(getattr(ot, "finished", True)),
                 })
 

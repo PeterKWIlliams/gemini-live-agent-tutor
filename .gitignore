@@ -3,5 +3,8 @@
 __pycache__/
 *.pyc
 AGENTS.md
+.claude/
 client/node_modules/
 client/dist/
+sample.aiff
+sample_audio.wav

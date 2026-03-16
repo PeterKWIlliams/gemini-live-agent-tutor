@@ -1,0 +1,37 @@
+<svg width="1280" height="620" viewBox="0 0 1280 620" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1280" height="620" rx="28" fill="#FFF8F0"/>
+  <rect x="48" y="44" width="1184" height="532" rx="28" fill="#F8F2E8" stroke="#E8DCCB"/>
+  <rect x="94" y="148" width="314" height="260" rx="30" fill="#FFFFFF" stroke="#E4D8C8"/>
+  <rect x="484" y="104" width="314" height="348" rx="30" fill="#18222B"/>
+  <rect x="874" y="148" width="314" height="260" rx="30" fill="#FFFFFF" stroke="#E4D8C8"/>
+  <path d="M408 276H484" stroke="#F28C55" stroke-width="10" stroke-linecap="round"/>
+  <path d="M798 276H874" stroke="#67A46B" stroke-width="10" stroke-linecap="round"/>
+  <path d="M446 252L484 276L446 300" fill="#F28C55"/>
+  <path d="M836 252L874 276L836 300" fill="#67A46B"/>
+  <text x="94" y="94" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18" letter-spacing="4">TEACHBACK ARCHITECTURE</text>
+  <text x="126" y="194" fill="#18222B" font-family="Fraunces, Georgia, serif" font-size="38">React Frontend</text>
+  <text x="126" y="232" fill="#18222B" font-family="DM Sans, Arial, sans-serif" font-size="20">Voice UI, setup flow, transcript, results</text>
+  <text x="126" y="282" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• Mic capture + PCM encoding</text>
+  <text x="126" y="316" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• File / text / topic submission</text>
+  <text x="126" y="350" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• WebSocket playback + transcript</text>
+  <text x="126" y="384" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• Results scorecard</text>
+  <text x="516" y="152" fill="#F7F2E8" font-family="Fraunces, Georgia, serif" font-size="38">FastAPI Backend</text>
+  <text x="516" y="190" fill="#F7F2E8" font-family="DM Sans, Arial, sans-serif" font-size="20">Cloud Run hosted API and Live proxy</text>
+  <text x="516" y="246" fill="#BCE0C0" font-family="DM Sans, Arial, sans-serif" font-size="18">• /api/upload and /api/topic</text>
+  <text x="516" y="280" fill="#BCE0C0" font-family="DM Sans, Arial, sans-serif" font-size="18">• Material parsing with gemini-2.5-flash</text>
+  <text x="516" y="314" fill="#BCE0C0" font-family="DM Sans, Arial, sans-serif" font-size="18">• Gemini Live WebSocket bridge</text>
+  <text x="516" y="348" fill="#BCE0C0" font-family="DM Sans, Arial, sans-serif" font-size="18">• score_session tool + fallback scoring</text>
+  <text x="516" y="382" fill="#BCE0C0" font-family="DM Sans, Arial, sans-serif" font-size="18">• Static frontend serving in production</text>
+  <text x="906" y="194" fill="#18222B" font-family="Fraunces, Georgia, serif" font-size="38">Gemini APIs</text>
+  <text x="906" y="232" fill="#18222B" font-family="DM Sans, Arial, sans-serif" font-size="20">Grounded learning + real-time audio</text>
+  <text x="906" y="282" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• gemini-2.5-flash for parsing</text>
+  <text x="906" y="316" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• Native audio live model for sessions</text>
+  <text x="906" y="350" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• Input + output transcription</text>
+  <text x="906" y="384" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="18">• Function calling for scorecard data</text>
+  <rect x="420" y="224" width="124" height="104" rx="20" fill="#FFE1CF"/>
+  <text x="450" y="262" fill="#9C5428" font-family="DM Sans, Arial, sans-serif" font-size="14" letter-spacing="2">WS AUDIO</text>
+  <text x="450" y="290" fill="#9C5428" font-family="DM Sans, Arial, sans-serif" font-size="14" letter-spacing="2">+ HTTP</text>
+  <rect x="810" y="224" width="124" height="104" rx="20" fill="#E6F2E8"/>
+  <text x="828" y="262" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="14" letter-spacing="2">LIVE API</text>
+  <text x="828" y="290" fill="#40664C" font-family="DM Sans, Arial, sans-serif" font-size="14" letter-spacing="2">STREAM</text>
+</svg>

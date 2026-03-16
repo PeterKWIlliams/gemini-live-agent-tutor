@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+AGENTS.md
+client/node_modules/
+client/dist/

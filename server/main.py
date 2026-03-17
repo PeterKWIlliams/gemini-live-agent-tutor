@@ -11,6 +11,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import uuid
 import wave
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from server.gemini_session import (
+    create_correction_session,
     create_live_session,
     extract_from_response,
     send_audio_chunk,
@@ -51,6 +53,15 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 SESSION_TTL = timedelta(minutes=15)
 STOP_TOOL_TIMEOUT_SECONDS = 8
 WRAP_UP_WAIT_SECONDS = 4
+ISSUE_DETECTION_MODEL = "gemini-2.5-flash"
+ISSUE_DETECTION_MIN_WORDS = 8
+ISSUE_DETECTION_COOLDOWN = timedelta(seconds=18)
+ISSUE_DETECTION_TIMEOUT_SECONDS = 4
+ISSUE_DETECTION_MATERIAL_CHARS = 3200
+CORRECTION_VERIFICATION_MODEL = "gemini-2.5-flash"
+CORRECTION_VERIFICATION_TIMEOUT_SECONDS = 3
+CORRECTION_TIMEOUT_SECONDS = 60
+CORRECTION_HANDOFF_LINE = "Correct. That's the key idea. I'm handing you back to the main tutor now."
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 TRAILS_DB_PATH = Path(os.getenv("TEACHBACK_DB_PATH", STATIC_DIR.parent / "data" / "teachback.db"))
 PRESET_TRAILS_DIR = Path(os.getenv("PRESET_TRAILS_DIR", STATIC_DIR.parent / "seed_documents"))
@@ -109,7 +120,9 @@ class RuntimeState:
     mode_id: str
     persona_id: str
     material: str
+    orchestrator_state: str = "main_active"
     transcript: list[dict[str, str]] = field(default_factory=list)
+    correction_transcript: list[dict[str, str]] = field(default_factory=list)
     tool_called: asyncio.Event = field(default_factory=asyncio.Event)
     session_closed: asyncio.Event = field(default_factory=asyncio.Event)
     scores: dict[str, Any] | None = None
@@ -117,7 +130,25 @@ class RuntimeState:
     last_agent_text: str = ""
     partial_user_text: str = ""
     partial_agent_text: str = ""
+    correction_last_user_text: str = ""
+    correction_last_agent_text: str = ""
+    correction_partial_user_text: str = ""
+    correction_partial_agent_text: str = ""
     close_task: asyncio.Task | None = None
+    issue_detection_task: asyncio.Task | None = None
+    correction_completion_task: asyncio.Task | None = None
+    correction_verification_task: asyncio.Task | None = None
+    correction_timeout_task: asyncio.Task | None = None
+    interruption_active: bool = False
+    last_issue_signature: str = ""
+    last_issue_at: datetime | None = None
+    pending_issue_signature: str = ""
+    pending_issue_claim: str = ""
+    pending_issue_expected_correction: str = ""
+    correction_closing_started: bool = False
+    correction_closing_transcript_seen: bool = False
+    resolved_issue_signatures: set[str] = field(default_factory=set)
+    resolved_issue_claims: list[str] = field(default_factory=list)
 
 
 class SessionStore:
@@ -190,8 +221,473 @@ def pdf_label_from_filename(filename: str) -> str:
     return stem.title() or filename
 
 
+def build_learning_goals_text(trail: TrailRecord) -> str:
+    seed_key = (trail.seed_key or "").strip()
+    templates = {
+        "software_engineering_interview_pack": """
+Learning goals
+
+Session objective:
+- Help the learner explain core interview concepts clearly enough to defend them out loud.
+
+Must cover:
+- Why binary search depends on sorted input before any half-elimination step is valid.
+- The difference between time complexity, space complexity, and practical tradeoffs.
+- At least one data-structure choice and why it fits a specific use case.
+- A simple system-design tradeoff such as latency vs throughput or consistency vs complexity.
+
+Checkpoint cues:
+- Ask the learner to explain Big O in plain language instead of only naming symbols.
+- Ask for one concrete example where a hash map is a better fit than a list scan.
+- Ask the learner to connect an algorithm choice to a real interview scenario.
+
+Misconceptions to catch:
+- "Binary search works on any list."
+- "Big O is the exact runtime."
+- "More data structures is always better than the simplest working choice."
+
+Success signal:
+- The learner explains the condition, mechanism, and tradeoff behind at least one core concept without hand-waving.
+""",
+        "machine_learning_fundamentals": """
+Learning goals
+
+Session objective:
+- Help the learner explain how a basic supervised-learning pipeline works from data to evaluation.
+
+Must cover:
+- The difference between training, validation, and test data.
+- Bias vs variance and why both matter.
+- Why regularization helps control overfitting.
+- One meaningful evaluation metric and when to use it.
+
+Checkpoint cues:
+- Ask the learner to explain overfitting without relying on buzzwords.
+- Ask what changes when the task is classification instead of regression.
+- Ask for one example of a model doing well on training data but poorly on unseen data.
+
+Misconceptions to catch:
+- "Higher training accuracy always means the model is better."
+- "Bias is always bad and variance is always good."
+- "Regularization just makes the model more complicated."
+
+Success signal:
+- The learner can relate model behavior, generalization, and evaluation back to the data split clearly.
+""",
+        "product_sense_and_mvp_strategy": """
+Learning goals
+
+Session objective:
+- Help the learner reason from user pain to an MVP decision with clear product tradeoffs.
+
+Must cover:
+- The user problem being solved and why it matters.
+- What an MVP includes versus what it intentionally leaves out.
+- How success would be measured after launch.
+- One concrete tradeoff between speed, scope, and user value.
+
+Checkpoint cues:
+- Ask the learner to identify the riskiest assumption in the product idea.
+- Ask what should be cut first if the team only had one week to ship.
+- Ask how they would tell whether users actually got value from the MVP.
+
+Misconceptions to catch:
+- "An MVP should include every feature users asked for."
+- "More polished design always matters more than solving the pain point."
+- "If users like the idea in theory, the product already has product-market fit."
+
+Success signal:
+- The learner can defend a narrow MVP that still tests the core value proposition.
+""",
+        "personal_finance_basics": """
+Learning goals
+
+Session objective:
+- Help the learner connect everyday money habits to long-term financial stability.
+
+Must cover:
+- The purpose of a budget and what it actually tracks.
+- Why emergency savings matter before bigger investing goals.
+- How interest works for savings versus debt.
+- One important credit-health behavior such as on-time payments or utilization.
+
+Checkpoint cues:
+- Ask the learner to explain the difference between needs, wants, and fixed obligations.
+- Ask why minimum payments can keep someone in debt for a long time.
+- Ask for one realistic first step for someone with no savings buffer.
+
+Misconceptions to catch:
+- "Budgeting means you can never spend on fun."
+- "A credit card balance helps your score more than paying it down."
+- "Saving can wait until debt disappears entirely in every case."
+
+Success signal:
+- The learner can explain at least one practical decision they would make differently after the session.
+""",
+        "climate_change_and_energy_basics": """
+Learning goals
+
+Session objective:
+- Help the learner explain climate basics and energy tradeoffs without collapsing everything into slogans.
+
+Must cover:
+- The difference between weather, climate, and long-term trends.
+- How greenhouse gases affect warming.
+- Why energy systems involve tradeoffs between reliability, cost, and emissions.
+- One example of how renewable energy helps and one challenge that still has to be managed.
+
+Checkpoint cues:
+- Ask the learner to explain why a single cold day does not disprove climate change.
+- Ask what changes on the grid when renewable generation grows.
+- Ask for one policy or infrastructure challenge that exists even when the science is clear.
+
+Misconceptions to catch:
+- "Weather and climate are basically the same thing."
+- "Renewables solve the whole energy problem with no tradeoffs."
+- "If emissions are invisible, they are not measurable."
+
+Success signal:
+- The learner can explain both the science and the energy-system tradeoffs in the same answer.
+""",
+    }
+    template = templates.get(seed_key)
+    if template:
+        return normalize_text(template)
+
+    title = trail.title.strip() or "this study trail"
+    description = trail.description.strip() or "the selected source material"
+    return normalize_text(
+        f"""
+Learning goals
+
+Session objective:
+- Help the learner build a confident spoken explanation of {title}.
+
+Must cover:
+- The central ideas in {description}.
+- At least one mechanism, example, or tradeoff from the source material.
+- One point where the learner has to move beyond memorized wording.
+
+Checkpoint cues:
+- Ask the learner to restate a key concept in plain language.
+- Ask what idea connects the most important concepts together.
+- Ask for one specific example that proves the explanation is grounded.
+
+Success signal:
+- The learner can explain the material clearly enough that another person could follow it.
+"""
+    )
+
+
 def build_transcript_text(messages: list[dict[str, str]]) -> str:
     return "\n".join(f"{item['speaker']}: {item['text']}" for item in messages if item["text"].strip())
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\S+", text or ""))
+
+
+def issue_signature(text: str) -> str:
+    return normalize_text(text).lower()
+
+
+def recent_transcript_excerpt(messages: list[dict[str, str]], limit: int = 6) -> str:
+    recent = messages[-limit:]
+    return "\n".join(f"{item['speaker']}: {item['text']}" for item in recent if item["text"].strip())
+
+
+def resolved_issues_excerpt(claims: list[str], limit: int = 5) -> str:
+    recent = [claim for claim in claims[-limit:] if claim.strip()]
+    return "\n".join(f"- {claim}" for claim in recent)
+
+
+def compact_grounding_excerpt(material: str, max_chars: int = ISSUE_DETECTION_MATERIAL_CHARS) -> str:
+    return normalize_text(material)[:max_chars]
+
+
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    candidates = [raw]
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(raw[start : end + 1])
+
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+async def detect_learning_issue(
+    client,
+    material: str,
+    transcript_excerpt: str,
+    latest_user_text: str,
+    resolved_issue_context: str = "",
+) -> dict[str, Any] | None:
+    if count_words(latest_user_text) < ISSUE_DETECTION_MIN_WORDS:
+        LOGGER.info(
+            "Issue detection skipped for short turn (%d words): %s",
+            count_words(latest_user_text),
+            latest_user_text[:160],
+        )
+        return None
+
+    LOGGER.info("Issue detection evaluating latest user turn: %s", latest_user_text[:240])
+
+    prompt = f"""
+You are reviewing a live tutoring session and deciding whether the latest user turn contains a factual mistake or misconception that should be corrected right now.
+
+Only flag an issue when all of the following are true:
+- the user made a concrete knowledge claim
+- the claim is meaningfully wrong or misleading
+- correcting it now would improve the lesson
+
+Do not flag:
+- harmless simplifications
+- incomplete thoughts
+- open questions
+- statements that are not clearly wrong
+
+Already resolved misconceptions in this session:
+{resolved_issue_context or "None recorded yet."}
+
+Do not flag one of those already-resolved misconceptions again unless the latest user turn clearly reasserts the same incorrect claim after the correction.
+
+Return JSON only with this exact shape:
+{{
+  "flag": false,
+  "claim": "",
+  "cue": "",
+  "prompt": "",
+  "suggested_correction": "",
+  "confidence": 0.0
+}}
+
+If you set "flag" to true:
+- "claim" should name the mistaken claim in one sentence
+- "cue" should be a short UI line explaining why the claim matters
+- "prompt" should ask the learner to restate the corrected idea
+- "suggested_correction" should be a concise correction the sidecar can preload
+- "confidence" should be between 0 and 1
+
+Reference material excerpt:
+{compact_grounding_excerpt(material)}
+
+Recent conversation:
+{transcript_excerpt or "No recent transcript yet."}
+
+Latest user turn:
+{latest_user_text}
+""".strip()
+
+    try:
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=ISSUE_DETECTION_MODEL,
+                contents=prompt,
+            ),
+            timeout=ISSUE_DETECTION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        LOGGER.warning("Issue detection timed out for latest turn: %s", latest_user_text[:120])
+        return None
+    except Exception as exc:  # pragma: no cover - external API behavior
+        LOGGER.warning("Issue detection failed: %s", exc)
+        return None
+
+    raw_response_text = (response.text or "").strip()
+    LOGGER.info("Issue detection raw response: %s", raw_response_text[:500])
+    payload = parse_json_object(raw_response_text)
+    if not payload:
+        LOGGER.warning("Issue detection returned unparsable JSON for turn: %s", latest_user_text[:160])
+        return None
+    if not payload.get("flag"):
+        LOGGER.info("Issue detection decided not to flag this turn.")
+        return None
+
+    confidence = float(payload.get("confidence") or 0)
+    claim = normalize_text(str(payload.get("claim") or ""))
+    cue = normalize_text(str(payload.get("cue") or ""))
+    prompt_text = normalize_text(str(payload.get("prompt") or ""))
+    suggested_correction = normalize_text(str(payload.get("suggested_correction") or ""))
+
+    if confidence < 0.72 or not claim or not suggested_correction:
+        LOGGER.info(
+            "Issue detection rejected candidate: confidence=%.2f claim=%s suggested=%s",
+            confidence,
+            claim or "<empty>",
+            "yes" if suggested_correction else "no",
+        )
+        return None
+
+    LOGGER.info("Issue detection flagged claim: %s (confidence=%.2f)", claim, confidence)
+    return {
+        "claim": claim,
+        "cue": cue or f"Potential misconception flagged: {claim}",
+        "prompt": prompt_text
+        or f"I paused the lesson because I caught a likely misconception: “{claim}.” Can you restate the corrected idea clearly?",
+        "suggestedCorrection": suggested_correction,
+        "confidence": confidence,
+    }
+
+
+async def verify_correction_turn(
+    client,
+    issue_claim: str,
+    expected_correction: str,
+    learner_turn: str,
+    transcript_excerpt: str,
+) -> dict[str, Any] | None:
+    learner_turn = normalize_text(learner_turn)
+    if count_words(learner_turn) < ISSUE_DETECTION_MIN_WORDS:
+        return None
+
+    prompt = f"""
+You are checking whether a learner has correctly restated a corrected idea during a live tutoring interruption.
+
+Return JSON only with this exact shape:
+{{
+  "accepted": false,
+  "resolved_summary": "",
+  "confidence": 0.0
+}}
+
+Accept the learner's response when it clearly captures the corrected idea, even if the wording is not identical.
+Reject it if it is still wrong, still vague, or misses the key condition needed to fix the misconception.
+
+Misconception being corrected:
+{issue_claim}
+
+Expected corrected idea:
+{expected_correction}
+
+Recent correction transcript:
+{transcript_excerpt or "No correction transcript yet."}
+
+Latest learner correction turn:
+{learner_turn}
+""".strip()
+
+    try:
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=CORRECTION_VERIFICATION_MODEL,
+                contents=prompt,
+            ),
+            timeout=CORRECTION_VERIFICATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        LOGGER.warning("Correction verification timed out for turn: %s", learner_turn[:160])
+        return None
+    except Exception as exc:  # pragma: no cover - external API behavior
+        LOGGER.warning("Correction verification failed: %s", exc)
+        return None
+
+    raw_response_text = (response.text or "").strip()
+    LOGGER.info("Correction verification raw response: %s", raw_response_text[:500])
+    payload = parse_json_object(raw_response_text)
+    if not payload:
+        LOGGER.warning("Correction verification returned unparsable JSON for turn: %s", learner_turn[:160])
+        return None
+
+    accepted = bool(payload.get("accepted"))
+    resolved_summary = normalize_text(str(payload.get("resolved_summary") or ""))
+    try:
+        confidence = float(payload.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if not accepted or confidence < 0.72:
+        LOGGER.info(
+            "Correction verifier did not accept learner turn: accepted=%s confidence=%.2f",
+            accepted,
+            confidence,
+        )
+        return None
+
+    return {
+        "resolved_summary": resolved_summary or expected_correction,
+        "confidence": max(0.0, min(confidence, 1.0)),
+    }
+
+
+def schedule_issue_detection(websocket: WebSocket, client, state: RuntimeState, latest_user_text: str):
+    latest_user_text = normalize_text(latest_user_text)
+    if not latest_user_text:
+        return
+    if state.session_closed.is_set() or state.tool_called.is_set() or state.interruption_active:
+        LOGGER.info(
+            "Issue detection not scheduled (closed=%s tool_called=%s interruption=%s) for turn: %s",
+            state.session_closed.is_set(),
+            state.tool_called.is_set(),
+            state.interruption_active,
+            latest_user_text[:160],
+        )
+        return
+
+    if state.issue_detection_task and not state.issue_detection_task.done():
+        LOGGER.info("Cancelling previous issue detection task before scheduling a new one.")
+        state.issue_detection_task.cancel()
+
+    async def _run():
+        try:
+            issue = await detect_learning_issue(
+                client,
+                state.material,
+                recent_transcript_excerpt(state.transcript, limit=4),
+                latest_user_text,
+                resolved_issues_excerpt(state.resolved_issue_claims),
+            )
+        except asyncio.CancelledError:
+            LOGGER.info("Issue detection task cancelled before completion.")
+            return
+
+        if not issue or state.session_closed.is_set() or state.interruption_active:
+            LOGGER.info(
+                "Issue detection produced no actionable signal (issue=%s closed=%s interruption=%s).",
+                bool(issue),
+                state.session_closed.is_set(),
+                state.interruption_active,
+            )
+            return
+
+        signature = issue_signature(issue.get("claim") or issue.get("suggestedCorrection") or "")
+        if signature and signature in state.resolved_issue_signatures:
+            LOGGER.info("Issue detection suppressed already-resolved claim: %s", issue.get("claim") or signature)
+            return
+        now = datetime.now(timezone.utc)
+        if (
+            signature
+            and state.last_issue_signature == signature
+            and state.last_issue_at is not None
+            and now - state.last_issue_at < ISSUE_DETECTION_COOLDOWN
+        ):
+            LOGGER.info("Issue detection suppressed duplicate claim during cooldown: %s", issue.get("claim") or signature)
+            return
+
+        state.last_issue_signature = signature
+        state.last_issue_at = now
+        state.pending_issue_signature = signature
+        state.pending_issue_claim = issue.get("claim") or ""
+        state.orchestrator_state = "correction_signaled"
+        LOGGER.info(
+            "Emitting correction_signal for session %s: claim=%s confidence=%s",
+            state.session_id,
+            issue.get("claim"),
+            issue.get("confidence"),
+        )
+        await websocket.send_json({"type": "correction_signal", "data": issue})
+
+    state.issue_detection_task = asyncio.create_task(_run())
 
 
 async def prepare_material_input(
@@ -834,47 +1330,78 @@ async def append_transcript(
     speaker: str,
     text: str,
     finished: bool = True,
+    channel: str = "main",
 ):
     if not text or not text.strip():
-        return
+        return None
+
+    if channel == "correction":
+        last_user_attr = "correction_last_user_text"
+        last_agent_attr = "correction_last_agent_text"
+        partial_user_attr = "correction_partial_user_text"
+        partial_agent_attr = "correction_partial_agent_text"
+        transcript_target = state.correction_transcript
+    else:
+        last_user_attr = "last_user_text"
+        last_agent_attr = "last_agent_text"
+        partial_user_attr = "partial_user_text"
+        partial_agent_attr = "partial_agent_text"
+        transcript_target = state.transcript
 
     if speaker == "user":
-        combined_raw = f"{state.partial_user_text}{text}" if state.partial_user_text else text
+        partial_user_text = getattr(state, partial_user_attr)
+        combined_raw = f"{partial_user_text}{text}" if partial_user_text else text
         combined_text = combined_raw.strip()
-        if combined_text == state.last_user_text and finished:
-            return
+        if combined_text == getattr(state, last_user_attr) and finished:
+            return None
         if finished:
-            state.last_user_text = combined_text
-            state.partial_user_text = ""
+            setattr(state, last_user_attr, combined_text)
+            setattr(state, partial_user_attr, "")
         else:
-            state.partial_user_text = combined_raw
+            setattr(state, partial_user_attr, combined_raw)
         message_type = "transcript_user"
     else:
-        combined_raw = f"{state.partial_agent_text}{text}" if state.partial_agent_text else text
+        partial_agent_text = getattr(state, partial_agent_attr)
+        combined_raw = f"{partial_agent_text}{text}" if partial_agent_text else text
         combined_text = combined_raw.strip()
-        if combined_text == state.last_agent_text and finished:
-            return
+        if combined_text == getattr(state, last_agent_attr) and finished:
+            return None
         if finished:
-            state.last_agent_text = combined_text
-            state.partial_agent_text = ""
+            setattr(state, last_agent_attr, combined_text)
+            setattr(state, partial_agent_attr, "")
         else:
-            state.partial_agent_text = combined_raw
+            setattr(state, partial_agent_attr, combined_raw)
         message_type = "transcript_agent"
 
     if finished:
-        state.transcript.append({"speaker": speaker, "text": combined_text})
-    await websocket.send_json({"type": message_type, "text": combined_text, "finished": finished})
+        transcript_target.append({"speaker": speaker, "text": combined_text})
+    await websocket.send_json({"type": message_type, "text": combined_text, "finished": finished, "channel": channel})
+    if speaker == "user" and finished and channel == "main":
+        LOGGER.info("Scheduling issue detection for finalized user turn: %s", combined_text[:240])
+        schedule_issue_detection(websocket, app.state.client, state, combined_text)
+    return combined_text if finished else None
 
 
-async def flush_partial_transcripts(websocket: WebSocket, state: RuntimeState):
+async def flush_partial_transcripts(websocket: WebSocket, state: RuntimeState, channel: str = "main"):
     """Finalize any in-progress transcript bubble when Gemini marks a turn complete."""
-    if state.partial_user_text:
-        await append_transcript(websocket, state, "user", state.partial_user_text, finished=True)
-    if state.partial_agent_text:
-        await append_transcript(websocket, state, "agent", state.partial_agent_text, finished=True)
+    finalized_user_texts: list[str] = []
+    if channel == "correction":
+        partial_user_text = state.correction_partial_user_text
+        partial_agent_text = state.correction_partial_agent_text
+    else:
+        partial_user_text = state.partial_user_text
+        partial_agent_text = state.partial_agent_text
+
+    if partial_user_text:
+        finalized_text = await append_transcript(websocket, state, "user", partial_user_text, finished=True, channel=channel)
+        if finalized_text:
+            finalized_user_texts.append(finalized_text)
+    if partial_agent_text:
+        await append_transcript(websocket, state, "agent", partial_agent_text, finished=True, channel=channel)
+    return finalized_user_texts
 
 
-async def handle_tool_call(
+async def handle_main_tool_call(
     websocket: WebSocket,
     live_session,
     state: RuntimeState,
@@ -903,20 +1430,53 @@ async def handle_tool_call(
     schedule_close_after_quiet_period(websocket, state)
 
 
+def normalize_correction_completion(raw: dict[str, Any]) -> dict[str, Any]:
+    resolved_claim = normalize_text(str(raw.get("resolved_claim") or ""))
+    resolved_summary = normalize_text(str(raw.get("resolved_summary") or ""))
+    try:
+        confidence = float(raw.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    return {
+        "resolved_claim": resolved_claim,
+        "resolved_summary": resolved_summary,
+        "confidence": max(0.0, min(confidence, 1.0)),
+    }
+
+
 async def stream_live_events(
     websocket: WebSocket,
     live_session,
     state: RuntimeState,
+    channel: str = "main",
+    tool_handler=None,
+    session_is_active=None,
+    on_finalized_user_turn=None,
 ):
     """Forward Gemini Live output to the frontend as it arrives."""
-    LOGGER.info("Receive loop entered for session %s", state.session_id)
+    LOGGER.info("Receive loop entered for session %s on channel %s", state.session_id, channel)
     response_count = 0
     turn_number = 0
 
     # session.receive() yields a finite async generator that exhausts after
     # each turn_complete.  Re-enter it for subsequent turns.
     while not state.session_closed.is_set():
+        if session_is_active is not None and not session_is_active():
+            LOGGER.info(
+                "Stopping receive loop for session %s on channel %s because the session is no longer active",
+                state.session_id,
+                channel,
+            )
+            break
         async for response in live_session.receive():
+            if session_is_active is not None and not session_is_active():
+                LOGGER.info(
+                    "Dropping receive loop response for session %s on channel %s because the session changed",
+                    state.session_id,
+                    channel,
+                )
+                return
             response_count += 1
             # Read SDK response fields directly (no model_dump / dict-scraping)
             result = extract_from_response(response)
@@ -928,55 +1488,77 @@ async def stream_live_events(
 
             if user_texts or agent_texts:
                 LOGGER.info(
-                    "Live transcription event (turn %d, msg #%d) user=%s agent=%s",
+                    "Live transcription event (channel=%s, turn %d, msg #%d) user=%s agent=%s",
+                    channel,
                     turn_number,
                     response_count,
                     user_texts,
                     agent_texts,
                 )
             for item in user_texts:
-                await append_transcript(
+                finalized_text = await append_transcript(
                     websocket,
                     state,
                     "user",
                     item["text"],
                     finished=item.get("finished", True),
+                    channel=channel,
                 )
+                if finalized_text and on_finalized_user_turn is not None:
+                    await on_finalized_user_turn(finalized_text)
             for item in agent_texts:
+                if channel == "correction" and state.correction_closing_started:
+                    agent_text = normalize_text(item["text"])
+                    if agent_text and (
+                        "handing you back" in agent_text.lower()
+                        or issue_signature(agent_text) == issue_signature(CORRECTION_HANDOFF_LINE)
+                    ):
+                        state.correction_closing_transcript_seen = True
+                if channel == "main" and state.interruption_active:
+                    continue
                 await append_transcript(
                     websocket,
                     state,
                     "agent",
                     item["text"],
                     finished=item.get("finished", True),
+                    channel=channel,
                 )
 
             for audio_message in audio_messages:
-                await websocket.send_json({"type": "audio", "data": audio_message})
+                if channel == "main" and state.interruption_active:
+                    continue
+                await websocket.send_json({"type": "audio", "data": audio_message, "channel": channel})
 
             for tool_call in tool_calls:
-                await handle_tool_call(websocket, live_session, state, tool_call)
+                if tool_handler:
+                    await tool_handler(websocket, live_session, state, tool_call)
 
             if result["turn_complete"]:
-                await flush_partial_transcripts(websocket, state)
+                finalized_user_texts = await flush_partial_transcripts(websocket, state, channel=channel)
+                if on_finalized_user_turn is not None:
+                    for finalized_text in finalized_user_texts:
+                        await on_finalized_user_turn(finalized_text)
                 turn_number += 1
                 LOGGER.info(
-                    "Turn complete for session %s (turn %d, %d responses so far)",
+                    "Turn complete for session %s on channel %s (turn %d, %d responses so far)",
                     state.session_id,
+                    channel,
                     turn_number,
                     response_count,
                 )
 
             if result["interrupted"]:
-                LOGGER.info("Interrupted flag for session %s (turn %d)", state.session_id, turn_number)
+                LOGGER.info("Interrupted flag for session %s on channel %s (turn %d)", state.session_id, channel, turn_number)
 
-            if state.tool_called.is_set() and not state.session_closed.is_set():
+            if channel == "main" and state.tool_called.is_set() and not state.session_closed.is_set():
                 if agent_texts or audio_messages or tool_calls:
                     schedule_close_after_quiet_period(websocket, state)
 
         LOGGER.info(
-            "Receive generator exhausted for session %s after turn %d — re-entering for next turn",
+            "Receive generator exhausted for session %s on channel %s after turn %d — re-entering for next turn",
             state.session_id,
+            channel,
             turn_number,
         )
 
@@ -1010,6 +1592,47 @@ async def end_session_with_safety_net(
             LOGGER.warning("Live wrap-up after fallback failed: %s", exc)
 
     await maybe_close_session(websocket, state)
+
+
+async def pause_for_interruption(websocket: WebSocket, live_session, state: RuntimeState):
+    state.interruption_active = True
+    if state.issue_detection_task and not state.issue_detection_task.done():
+        state.issue_detection_task.cancel()
+    await websocket.send_json({"type": "interruption_started"})
+    await send_text_instruction(
+        live_session,
+        "Pause the current lesson immediately. Do not continue speaking until you receive a resume instruction.",
+    )
+
+
+def register_pending_issue(state: RuntimeState, signature: str = "", claim: str = ""):
+    signature = issue_signature(signature)
+    claim = normalize_text(claim)
+    if signature:
+        state.pending_issue_signature = signature
+    if claim:
+        state.pending_issue_claim = claim
+    state.correction_closing_started = False
+    state.correction_closing_transcript_seen = False
+
+
+async def resume_after_interruption(websocket: WebSocket, live_session, state: RuntimeState, summary: str):
+    state.interruption_active = False
+    if state.pending_issue_signature:
+        state.resolved_issue_signatures.add(state.pending_issue_signature)
+    if state.pending_issue_claim:
+        state.resolved_issue_claims.append(state.pending_issue_claim)
+    state.pending_issue_signature = ""
+    state.pending_issue_claim = ""
+    await websocket.send_json({"type": "interruption_resumed"})
+    await send_text_instruction(
+        live_session,
+        (
+            "A correction sidecar just resolved a confusion for the user. "
+            f"Here is the clarification to incorporate: {summary.strip()} "
+            "Acknowledge the clarification briefly, then continue the lesson from where you left off."
+        ),
+    )
 
 
 app = FastAPI(title="TeachBack", version="0.1.0")
@@ -1194,6 +1817,7 @@ async def prepare_preset_trail(trail_id: str):
 
     record = await create_prepared_session(app.state.store, trail.merged_material)
     payload = build_session_payload(record)
+    payload["learning_goals"] = build_learning_goals_text(trail)
     source_documents = await get_source_documents_for_trail(app.state, trail)
     payload["source_documents"] = [
         {
@@ -1241,8 +1865,23 @@ async def websocket_session(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
-    receive_task = None
+    main_receive_task = None
+    correction_receive_task = None
+    main_live_session_cm = None
+    correction_live_session_cm = None
+    main_live_session = None
+    correction_live_session = None
     state: RuntimeState | None = None
+
+    async def cancel_task(task: asyncio.Task | None):
+        if task is None:
+            return
+        task.cancel()
+        current_task = asyncio.current_task()
+        if task is current_task:
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     try:
         LOGGER.info("Waiting for start message for session %s", session_id)
@@ -1264,99 +1903,427 @@ async def websocket_session(websocket: WebSocket, session_id: str):
             persona_id=persona_id,
             material=record.material,
         )
+        audio_debug: dict[str, dict[str, Any]] = {
+            "main": {"buffer": bytearray(), "sample_rate": 0, "chunk_count": 0},
+            "correction": {"buffer": bytearray(), "sample_rate": 0, "chunk_count": 0},
+        }
 
-        LOGGER.info(
-            "Opening Gemini Live session for session %s with mode=%s persona=%s",
-            session_id,
-            mode_id,
-            persona_id,
-        )
-        async with create_live_session(app.state.client, mode_id, persona_id, record.material) as live_session:
-            LOGGER.info("Gemini Live session connected for session %s", session_id)
-
-            # One-time: log the SDK method signature so we can verify param names
-            try:
-                sig = inspect.signature(live_session.send_realtime_input)
-                LOGGER.info("send_realtime_input params: %s", list(sig.parameters.keys()))
-            except Exception:
-                pass
-
-            receive_task = asyncio.create_task(stream_live_events(websocket, live_session, state))
-            LOGGER.info("Started receive task for session %s", session_id)
-
-            def _log_receive_task_failure(task: asyncio.Task):
+        def log_receive_task_failure(label: str):
+            def _callback(task: asyncio.Task):
                 if task.cancelled():
                     return
                 exc = task.exception()
                 if exc:
-                    LOGGER.exception("Receive task failed for session %s", session_id, exc_info=exc)
+                    LOGGER.exception("%s receive task failed for session %s", label, session_id, exc_info=exc)
 
-            receive_task.add_done_callback(_log_receive_task_failure)
+            return _callback
 
-            await websocket.send_json({"type": "ready"})
-            LOGGER.info("Sent ready message to client for session %s", session_id)
+        async def close_main_live_session():
+            nonlocal main_receive_task, main_live_session_cm, main_live_session
+            await cancel_task(main_receive_task)
+            main_receive_task = None
+            if main_live_session_cm is not None:
+                await main_live_session_cm.__aexit__(None, None, None)
+            main_live_session_cm = None
+            main_live_session = None
 
-            # Debug: accumulate audio to save as WAV for inspection
-            audio_debug_buffer = bytearray()
-            audio_chunk_count = 0
-            audio_sample_rate = 0  # detected from first chunk
-            audio_turn_number = 0  # incremented on each audio_stream_end
+        async def close_correction_live_session():
+            nonlocal correction_receive_task, correction_live_session_cm, correction_live_session
+            if state.correction_verification_task and not state.correction_verification_task.done():
+                verification_task = state.correction_verification_task
+                state.correction_verification_task.cancel()
+                if verification_task is not asyncio.current_task():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await verification_task
+            state.correction_verification_task = None
+            if state.correction_timeout_task and not state.correction_timeout_task.done():
+                timeout_task = state.correction_timeout_task
+                state.correction_timeout_task.cancel()
+                if timeout_task is not asyncio.current_task():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await timeout_task
+            state.correction_timeout_task = None
+            await cancel_task(correction_receive_task)
+            correction_receive_task = None
+            if correction_live_session_cm is not None:
+                await correction_live_session_cm.__aexit__(None, None, None)
+            correction_live_session_cm = None
+            correction_live_session = None
+            state.correction_partial_user_text = ""
+            state.correction_partial_agent_text = ""
+            state.correction_last_user_text = ""
+            state.correction_last_agent_text = ""
+            state.pending_issue_expected_correction = ""
+            state.correction_closing_started = False
+            state.correction_closing_transcript_seen = False
 
-            while True:
-                message = await websocket.receive_json()
-                message_type = message.get("type")
-                LOGGER.info("Received websocket message for session %s: %s", session_id, message_type)
+        async def open_main_live_session(continuation_context: str = ""):
+            nonlocal main_receive_task, main_live_session_cm, main_live_session
+            await close_main_live_session()
+            LOGGER.info(
+                "Opening Gemini Live main session for %s with mode=%s persona=%s",
+                session_id,
+                mode_id,
+                persona_id,
+            )
+            main_live_session_cm = create_live_session(
+                app.state.client,
+                mode_id,
+                persona_id,
+                record.material,
+                continuation_context=continuation_context,
+            )
+            main_live_session = await main_live_session_cm.__aenter__()
+            try:
+                sig = inspect.signature(main_live_session.send_realtime_input)
+                LOGGER.info("main send_realtime_input params: %s", list(sig.parameters.keys()))
+            except Exception:
+                pass
+            main_receive_task = asyncio.create_task(
+                stream_live_events(
+                    websocket,
+                    main_live_session,
+                    state,
+                    channel="main",
+                    tool_handler=handle_main_tool_call,
+                    session_is_active=lambda: main_live_session is not None,
+                    on_finalized_user_turn=None,
+                )
+            )
+            main_receive_task.add_done_callback(log_receive_task_failure("Main"))
+            state.orchestrator_state = "main_active"
 
-                if message_type == "audio":
-                    try:
-                        pcm_bytes = base64.b64decode(message.get("data", ""))
-                    except Exception:
-                        await websocket.send_json({"type": "error", "message": "Invalid audio payload."})
-                        continue
-                    # Detect sample rate: prefer client-supplied field,
-                    # fall back to inferring from chunk size (4096-sample
-                    # ScriptProcessor buffer → 8192 bytes at native rate).
-                    client_rate = message.get("sampleRate")
-                    if client_rate:
-                        audio_sample_rate = int(client_rate)
-                    elif audio_sample_rate == 0:
-                        # 8192 bytes = 4096 samples → 48 kHz native
-                        # 2730 bytes = 1365 samples → old 16 kHz resample
-                        audio_sample_rate = 48000 if len(pcm_bytes) >= 8000 else 16000
-                    audio_chunk_count += 1
-                    audio_debug_buffer.extend(pcm_bytes)
-                    if audio_chunk_count == 1:
-                        LOGGER.info(
-                            "Turn %d first audio chunk: %d bytes, rate=%d (from_client=%s)",
-                            audio_turn_number, len(pcm_bytes), audio_sample_rate, client_rate,
-                        )
-                    await send_audio_chunk(live_session, pcm_bytes, audio_sample_rate)
+        async def reopen_main_live_session_with_continuation(resolved_claim: str, resolved_summary: str):
+            continuation_context = normalize_text(
+                f"""
+Recent transcript excerpt:
+{recent_transcript_excerpt(state.transcript, limit=8)}
 
-                elif message_type == "audio_stream_end":
-                    LOGGER.info(
-                        "Ignoring intermediate audio_stream_end for session %s turn %d (%d chunks, %d bytes total)",
-                        session_id, audio_turn_number, audio_chunk_count, len(audio_debug_buffer),
+Resolved correction:
+Claim: {resolved_claim}
+Summary: {resolved_summary}
+
+Resume the lesson naturally. Acknowledge the correction briefly if needed, then continue from the existing lesson context.
+"""
+            )
+            await open_main_live_session(continuation_context=continuation_context)
+
+        async def inject_correction_into_main(resolved_claim: str, resolved_summary: str):
+            prompt = normalize_text(
+                f"""
+A correction agent just resolved a confusion for the user.
+
+Resolved claim:
+{resolved_claim}
+
+Correction to incorporate:
+{resolved_summary}
+
+Acknowledge the correction briefly, then continue the lesson from where you left off.
+"""
+            )
+            try:
+                if main_live_session is None:
+                    raise RuntimeError("Main live session is unavailable.")
+                await send_text_instruction(main_live_session, prompt)
+            except Exception as exc:
+                LOGGER.warning("Main session correction injection failed, recreating main session: %s", exc)
+                await reopen_main_live_session_with_continuation(resolved_claim, resolved_summary)
+
+        async def complete_correction_and_resume(resolved_claim: str, resolved_summary: str, confidence: float):
+            resolved_claim = normalize_text(resolved_claim or state.pending_issue_claim)
+            resolved_summary = normalize_text(resolved_summary)
+            if not resolved_summary:
+                return
+            if state.correction_completion_task and state.correction_completion_task is not asyncio.current_task():
+                if state.correction_completion_task.done():
+                    state.correction_completion_task = None
+            if state.correction_closing_started:
+                return
+
+            if state.pending_issue_signature:
+                state.resolved_issue_signatures.add(state.pending_issue_signature)
+            if resolved_claim:
+                state.resolved_issue_claims.append(resolved_claim)
+            state.pending_issue_signature = ""
+            state.pending_issue_claim = ""
+            state.pending_issue_expected_correction = ""
+            state.orchestrator_state = "correction_closing"
+            state.correction_closing_started = True
+            if correction_live_session is not None:
+                with contextlib.suppress(Exception):
+                    await send_text_instruction(
+                        correction_live_session,
+                        f'Say exactly this one sentence, then stop: "{CORRECTION_HANDOFF_LINE}"',
                     )
-                    audio_turn_number += 1
-                    # Save first utterance as WAV for diagnosis
-                    if audio_debug_buffer:
-                        wav_path = f"/tmp/teachback_debug_{session_id[:8]}.wav"
-                        try:
-                            with wave.open(wav_path, "wb") as wf:
-                                wf.setnchannels(1)
-                                wf.setsampwidth(2)
-                                wf.setframerate(audio_sample_rate or 48000)
-                                wf.writeframes(bytes(audio_debug_buffer))
-                            LOGGER.info("Saved debug audio to %s (rate=%d)", wav_path, audio_sample_rate)
-                        except Exception as wav_exc:
-                            LOGGER.warning("Failed to save debug WAV: %s", wav_exc)
-                    audio_debug_buffer = bytearray()
-                    audio_chunk_count = 0
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while asyncio.get_running_loop().time() < deadline:
+                    if state.correction_closing_transcript_seen:
+                        break
+                    await asyncio.sleep(0.08)
+            await websocket.send_json(
+                {
+                    "type": "correction_complete",
+                    "data": {
+                        "resolved_claim": resolved_claim,
+                        "resolved_summary": resolved_summary,
+                        "confidence": confidence,
+                    },
+                }
+            )
+            await close_correction_live_session()
+            state.interruption_active = False
+            state.orchestrator_state = "main_resuming"
+            await inject_correction_into_main(resolved_claim, resolved_summary)
+            state.orchestrator_state = "main_active"
+            await websocket.send_json(
+                {
+                    "type": "interruption_resumed",
+                    "data": {
+                        "resolved_claim": resolved_claim,
+                        "resolved_summary": resolved_summary,
+                        "reason": "completed",
+                    },
+                }
+            )
 
-                elif message_type == "stop":
-                    await live_session.send_realtime_input(audio_stream_end=True)
-                    await end_session_with_safety_net(websocket, app.state.client, live_session, state)
-                    break
+        async def schedule_correction_verification(latest_user_text: str):
+            latest_user_text = normalize_text(latest_user_text)
+            if not latest_user_text or not state.interruption_active or state.correction_closing_started:
+                return
+            if not state.pending_issue_claim or not state.pending_issue_expected_correction:
+                return
+            if state.correction_verification_task and not state.correction_verification_task.done():
+                state.correction_verification_task.cancel()
+
+            async def _run():
+                try:
+                    state.orchestrator_state = "correction_verifying"
+                    verification = await verify_correction_turn(
+                        app.state.client,
+                        state.pending_issue_claim,
+                        state.pending_issue_expected_correction,
+                        latest_user_text,
+                        recent_transcript_excerpt(state.correction_transcript, limit=4),
+                    )
+                except asyncio.CancelledError:
+                    return
+                    if not verification or state.correction_closing_started or not state.interruption_active:
+                        if state.interruption_active and not state.correction_closing_started:
+                            state.orchestrator_state = "correction_active"
+                        return
+                if state.correction_completion_task and not state.correction_completion_task.done():
+                    return
+                state.correction_completion_task = asyncio.create_task(
+                    complete_correction_and_resume(
+                        state.pending_issue_claim,
+                        verification["resolved_summary"],
+                        verification["confidence"],
+                    )
+                )
+
+            state.correction_verification_task = asyncio.create_task(_run())
+
+        async def handle_correction_tool_call(
+            websocket: WebSocket,
+            live_session,
+            state: RuntimeState,
+            tool_call: dict[str, Any],
+        ):
+            if tool_call.get("name") != "complete_correction":
+                return
+
+            completion = normalize_correction_completion(tool_call.get("args") or {})
+            if not completion["resolved_summary"]:
+                return
+
+            await send_tool_response(
+                live_session,
+                [
+                    {
+                        "id": tool_call.get("id"),
+                        "name": "complete_correction",
+                        "response": {
+                            "status": "ok",
+                            "message": (
+                                "Correction accepted. In one short sentence, tell the learner they now have the "
+                                "right idea and that you are handing them back to the main tutor."
+                            ),
+                        },
+                    }
+                ],
+            )
+            if state.correction_closing_started:
+                return
+            if state.correction_completion_task and not state.correction_completion_task.done():
+                return
+            state.correction_completion_task = asyncio.create_task(
+                complete_correction_and_resume(
+                    completion["resolved_claim"],
+                    completion["resolved_summary"],
+                    completion["confidence"],
+                )
+            )
+
+        async def start_correction_session(issue_payload: dict[str, Any]):
+            nonlocal correction_receive_task, correction_live_session_cm, correction_live_session
+            if correction_live_session is not None:
+                return
+
+            issue_claim = normalize_text(str(issue_payload.get("claim") or "Potential misconception"))
+            issue_prompt = normalize_text(
+                str(issue_payload.get("prompt") or "Restate the corrected idea clearly in your own words.")
+            )
+            suggested_correction = normalize_text(str(issue_payload.get("suggestedCorrection") or issue_claim))
+            issue_signature_value = normalize_text(
+                str(issue_payload.get("issue_signature") or issue_claim)
+            )
+            register_pending_issue(state, issue_signature_value, issue_claim)
+            state.pending_issue_expected_correction = suggested_correction
+            state.interruption_active = True
+            state.orchestrator_state = "correction_connecting"
+            if state.issue_detection_task and not state.issue_detection_task.done():
+                state.issue_detection_task.cancel()
+
+            await websocket.send_json({"type": "interruption_started", "data": {"issue": issue_payload}})
+            if main_live_session is not None:
+                with contextlib.suppress(Exception):
+                    await send_text_instruction(
+                        main_live_session,
+                        "Pause the current lesson immediately. The correction agent is taking over briefly.",
+                    )
+            try:
+                correction_live_session_cm = create_correction_session(
+                    app.state.client,
+                    record.material,
+                    issue_claim,
+                    issue_prompt,
+                    suggested_correction,
+                )
+                correction_live_session = await correction_live_session_cm.__aenter__()
+                correction_receive_task = asyncio.create_task(
+                    stream_live_events(
+                        websocket,
+                        correction_live_session,
+                    state,
+                    channel="correction",
+                    tool_handler=handle_correction_tool_call,
+                    session_is_active=lambda: correction_live_session is not None,
+                    on_finalized_user_turn=schedule_correction_verification,
+                )
+            )
+                correction_receive_task.add_done_callback(log_receive_task_failure("Correction"))
+                async def correction_timeout_watch():
+                    try:
+                        await asyncio.sleep(CORRECTION_TIMEOUT_SECONDS)
+                    except asyncio.CancelledError:
+                        return
+                    if (
+                        state.session_closed.is_set()
+                        or not state.interruption_active
+                        or correction_live_session is None
+                    ):
+                        return
+                    LOGGER.info("Correction session timed out for session %s", session_id)
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "The correction agent took too long. Resuming the main lesson automatically.",
+                        }
+                    )
+                    await force_resume_main(reason="timeout")
+
+                state.correction_timeout_task = asyncio.create_task(correction_timeout_watch())
+                state.orchestrator_state = "correction_active"
+                await websocket.send_json({"type": "correction_ready", "data": {"issue": issue_payload}})
+                await send_text_instruction(
+                    correction_live_session,
+                    "Introduce yourself in one short sentence, explain the misconception briefly, and ask the learner to correct it.",
+                )
+            except Exception as exc:
+                LOGGER.warning("Correction session failed to start: %s", exc)
+                await close_correction_live_session()
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "message": "The correction agent could not start cleanly. Use Force resume to continue the main lesson.",
+                    }
+                )
+
+        async def force_resume_main(reason: str = "manual"):
+            state.interruption_active = False
+            state.pending_issue_signature = ""
+            state.pending_issue_claim = ""
+            state.pending_issue_expected_correction = ""
+            state.correction_closing_started = False
+            state.correction_closing_transcript_seen = False
+            await close_correction_live_session()
+            state.orchestrator_state = "main_active"
+            await websocket.send_json(
+                {
+                    "type": "interruption_resumed",
+                    "data": {
+                        "resolved_claim": "",
+                        "resolved_summary": "",
+                        "reason": reason,
+                    },
+                }
+            )
+
+        await open_main_live_session()
+        await websocket.send_json({"type": "ready"})
+        LOGGER.info("Sent ready message to client for session %s", session_id)
+
+        while True:
+            message = await websocket.receive_json()
+            message_type = message.get("type")
+            LOGGER.info("Received websocket message for session %s: %s", session_id, message_type)
+
+            if message_type == "audio":
+                try:
+                    pcm_bytes = base64.b64decode(message.get("data", ""))
+                except Exception:
+                    await websocket.send_json({"type": "error", "message": "Invalid audio payload."})
+                    continue
+
+                channel = str(message.get("channel") or ("correction" if state.interruption_active else "main"))
+                target_session = correction_live_session if channel == "correction" else main_live_session
+                if target_session is None:
+                    await websocket.send_json({"type": "error", "message": f"{channel.title()} agent is not available."})
+                    continue
+
+                audio_state = audio_debug[channel]
+                client_rate = message.get("sampleRate")
+                if client_rate:
+                    audio_state["sample_rate"] = int(client_rate)
+                elif audio_state["sample_rate"] == 0:
+                    audio_state["sample_rate"] = 48000 if len(pcm_bytes) >= 8000 else 16000
+                audio_state["chunk_count"] += 1
+                audio_state["buffer"].extend(pcm_bytes)
+                await send_audio_chunk(target_session, pcm_bytes, audio_state["sample_rate"])
+
+            elif message_type == "audio_stream_end":
+                channel = str(message.get("channel") or ("correction" if state.interruption_active else "main"))
+                target_session = correction_live_session if channel == "correction" else main_live_session
+                if target_session is not None:
+                    with contextlib.suppress(Exception):
+                        await target_session.send_realtime_input(audio_stream_end=True)
+                audio_debug[channel]["buffer"] = bytearray()
+                audio_debug[channel]["chunk_count"] = 0
+
+            elif message_type == "stop":
+                await close_correction_live_session()
+                if main_live_session is not None:
+                    await main_live_session.send_realtime_input(audio_stream_end=True)
+                    await end_session_with_safety_net(websocket, app.state.client, main_live_session, state)
+                break
+
+            elif message_type == "start_correction":
+                issue_payload = message.get("issue") or {}
+                await start_correction_session(issue_payload)
+
+            elif message_type == "cancel_correction":
+                await force_resume_main(reason="manual")
 
     except WebSocketDisconnect:
         LOGGER.info("Client disconnected from session %s", session_id)
@@ -1367,10 +2334,28 @@ async def websocket_session(websocket: WebSocket, session_id: str):
         except Exception:  # pragma: no cover - socket may already be closed
             pass
     finally:
-        if receive_task:
-            receive_task.cancel()
+        await cancel_task(correction_receive_task)
+        await cancel_task(main_receive_task)
+        if correction_live_session_cm is not None:
+            await correction_live_session_cm.__aexit__(None, None, None)
+        if main_live_session_cm is not None:
+            await main_live_session_cm.__aexit__(None, None, None)
+        if state and state.issue_detection_task:
+            state.issue_detection_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await receive_task
+                await state.issue_detection_task
+        if state and state.correction_completion_task:
+            state.correction_completion_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state.correction_completion_task
+        if state and state.correction_verification_task:
+            state.correction_verification_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state.correction_verification_task
+        if state and state.correction_timeout_task:
+            state.correction_timeout_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state.correction_timeout_task
         if state and state.close_task:
             state.close_task.cancel()
         if state and state.session_closed.is_set():

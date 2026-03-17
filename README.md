@@ -1,14 +1,17 @@
 # TeachBack
 
-TeachBack is a real-time AI learning companion that helps you understand topics by talking them through out loud.
+TeachBack is a small experimental project for testing the new Gemini Live Agent API with real-time voice sessions, grounded study material, and different tutoring behaviors.
 
-## The Problem
+## Overview
 
-Passive learning is sticky in the moment but weak over time. Re-reading notes, watching lectures, and skimming summaries can feel productive without proving that the material is actually understood. Research-backed active learning techniques do a much better job at exposing weak spots and improving retention.
+This repo is not meant to present TeachBack as a fully developed product. It is a fast-moving prototype built to explore:
 
-## The Solution
+- real-time voice interactions with Gemini Live
+- different agent personas and teaching modes
+- grounded sessions using preset material, PDFs, and prepared text
+- interruption and correction flows inside a live session
 
-TeachBack turns studying into a live voice conversation. Instead of passively consuming material, the learner explains, recalls, and reasons out loud while an AI persona responds in real time. The app uses proven techniques like the Feynman Technique, Socratic questioning, active recall, and interactive instruction to make understanding visible.
+The current app is a good sandbox for testing how Gemini Live behaves in multi-turn learning conversations, how fast interruption handoffs feel, and how grounded voice sessions work in practice.
 
 ## Learning Modes
 
@@ -88,3 +91,4 @@ chmod +x deploy.sh
 - Input and output transcription are enabled during live sessions.
 - The live session uses function calling for structured score output.
 - There is a fallback scoring safety net: if the live model does not call `score_session` after the user ends a session, the backend computes the same score schema from the transcript with `gemini-2.5-flash`.
+- This project should be read as a Gemini Live API experiment / demo app rather than a polished production product.

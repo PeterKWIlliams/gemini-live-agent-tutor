@@ -64,6 +64,32 @@ SCORE_FUNCTION = {
     },
 }
 
+COMPLETE_CORRECTION_FUNCTION = {
+    "name": "complete_correction",
+    "description": (
+        "Called when the correction agent has confirmed the learner can clearly restate the corrected idea "
+        "and the main lesson should resume."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "resolved_claim": {
+                "type": "string",
+                "description": "The misconception or mistaken claim that was addressed.",
+            },
+            "resolved_summary": {
+                "type": "string",
+                "description": "A concise corrected summary to hand back to the main tutor.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "0 to 1 confidence that the learner now has the corrected idea.",
+            },
+        },
+        "required": ["resolved_claim", "resolved_summary", "confidence"],
+    },
+}
+
 SCORING_FALLBACK_PROMPT = """
 You are scoring a TeachBack learning session. Return ONLY valid JSON matching the required schema.
 

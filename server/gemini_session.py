@@ -10,16 +10,18 @@ from google.genai import types
 
 from server.modes import MODES
 from server.personas import PERSONAS
-from server.scoring import SCORE_FUNCTION
+from server.scoring import COMPLETE_CORRECTION_FUNCTION, SCORE_FUNCTION
 
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 
 
-def build_system_prompt(mode_id: str, persona_id: str, material: str) -> str:
+def build_system_prompt(mode_id: str, persona_id: str, material: str, continuation_context: str = "") -> str:
     mode = MODES[mode_id]
     persona = PERSONAS[persona_id]
+    if continuation_context.strip():
+        material = f"{material}\n\nSession continuation context:\n{continuation_context.strip()}".strip()
     return mode["system_template"].format(
         material=material,
         persona_personality=persona["personality"],
@@ -35,10 +37,18 @@ def build_score_function_declaration():
     )
 
 
-def create_live_session(client, mode_id: str, persona_id: str, material: str):
+def build_complete_correction_function_declaration():
+    return types.FunctionDeclaration(
+        name=COMPLETE_CORRECTION_FUNCTION["name"],
+        description=COMPLETE_CORRECTION_FUNCTION["description"],
+        parameters=COMPLETE_CORRECTION_FUNCTION["parameters"],
+    )
+
+
+def create_live_session(client, mode_id: str, persona_id: str, material: str, continuation_context: str = ""):
     """Create a Gemini Live session for the selected mode/persona/material."""
     persona = PERSONAS[persona_id]
-    system_prompt = build_system_prompt(mode_id, persona_id, material)
+    system_prompt = build_system_prompt(mode_id, persona_id, material, continuation_context=continuation_context)
 
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -53,6 +63,57 @@ def create_live_session(client, mode_id: str, persona_id: str, material: str):
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         tools=[types.Tool(function_declarations=[build_score_function_declaration()])],
+    )
+    return client.aio.live.connect(model=MODEL, config=config)
+
+
+def build_correction_system_prompt(material: str, issue_claim: str, issue_prompt: str, suggested_correction: str) -> str:
+    return f"""
+You are the Correction Agent for TeachBack. Your job is to pause the main lesson briefly, fix one misconception, and then hand the user back to the main tutor.
+
+You are not the main tutor. Stay concise, corrective, and focused on one issue only.
+
+Issue to correct:
+{issue_claim}
+
+Prompt to anchor the learner:
+{issue_prompt}
+
+Target correction:
+{suggested_correction}
+
+Reference material:
+{material}
+
+Behavior rules:
+- Open with one short sentence explaining what needs correcting.
+- Ask the learner to restate the corrected idea clearly in their own words.
+- If they are still wrong or vague, ask one brief follow-up.
+- Do not lecture for multiple paragraphs.
+- Do not score the learner.
+- When the learner has corrected the idea clearly enough, say one short closing sentence confirming the fix and handing them back to the main tutor, then call complete_correction with a compact resolved summary.
+""".strip()
+
+
+def create_correction_session(client, material: str, issue_claim: str, issue_prompt: str, suggested_correction: str):
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name="Charon"
+                )
+            )
+        ),
+        system_instruction=build_correction_system_prompt(
+            material,
+            issue_claim,
+            issue_prompt,
+            suggested_correction,
+        ),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        tools=[types.Tool(function_declarations=[build_complete_correction_function_declaration()])],
     )
     return client.aio.live.connect(model=MODEL, config=config)
 

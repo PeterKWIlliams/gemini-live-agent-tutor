@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 const CLOSED = 3;
 
-export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {}) {
+export default function useWebSocket({ maxReconnectAttempts = 3, onMessage, onOpen } = {}) {
   const onMessageRef = useRef(onMessage);
+  const onOpenRef = useRef(onOpen);
   const socketRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
   const disconnectIntentRef = useRef(false);
@@ -15,6 +16,10 @@ export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {
   useEffect(() => {
     onMessageRef.current = onMessage;
   }, [onMessage]);
+
+  useEffect(() => {
+    onOpenRef.current = onOpen;
+  }, [onOpen]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimeoutRef.current) {
@@ -46,6 +51,7 @@ export default function useWebSocket({ maxReconnectAttempts = 3, onMessage } = {
       socket.onopen = () => {
         reconnectAttemptsRef.current = 0;
         setReadyState(socket.readyState);
+        onOpenRef.current?.(socket);
       };
 
       socket.onmessage = (event) => {

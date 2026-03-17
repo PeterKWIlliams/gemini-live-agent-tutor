@@ -23,8 +23,6 @@ Add your demo link here after recording.
 
 ## Architecture Diagram
 
-![TeachBack architecture](assets/architecture-diagram.svg)
-
 ## Tech Stack
 
 - Frontend: Vite, React, TanStack Query, Tailwind CSS, Web Audio API
